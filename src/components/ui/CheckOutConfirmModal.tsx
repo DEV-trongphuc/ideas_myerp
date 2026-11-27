@@ -1,0 +1,749 @@
+import React from 'react';
+import { createPortal } from 'react-dom';
+import { motion, AnimatePresence } from 'framer-motion';
+import { LogOut, Clock, MapPin, CheckCircle2, AlertTriangle, X, RefreshCw } from 'lucide-react';
+import { useLanguage } from '../../contexts/LanguageContext';
+import { getTenantWorkPolicy } from '../../contexts/TenantConfigContext';
+import { useTypedSetting } from '../../contexts/SettingsBootstrapContext';
+import { pushOverlay } from '../../utils/overlayStack';
+import { triggerFullConfetti } from '../../utils/confettiHelper';
+
+interface CheckOutConfirmModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => Promise<boolean | void> | boolean | void;
+  capturedImage?: string | null;
+  userName?: string;
+  userRole?: string;
+  checkInTime?: string;
+  shiftStartTime?: string;
+  shiftEndTime?: string;
+  lunchStartTime?: string;
+  lunchEndTime?: string;
+  maxWorkMinutes?: number;
+  address?: string;
+  isEarly?: boolean;
+  earlyMinutes?: number;
+  submitting?: boolean;
+  zIndex?: number;
+}
+
+const parseHmToMinutes = (hm: string | undefined, fallbackMin: number): number => {
+  if (!hm) return fallbackMin;
+  const parts = String(hm).substring(0, 5).split(':').map(Number);
+  if (parts.length !== 2 || isNaN(parts[0]) || isNaN(parts[1])) return fallbackMin;
+  return parts[0] * 60 + parts[1];
+};
+
+export const CheckOutConfirmModal: React.FC<CheckOutConfirmModalProps> = ({
+  isOpen,
+  onClose,
+  onConfirm,
+  capturedImage,
+  userName,
+  userRole,
+  checkInTime,
+  shiftStartTime,
+  shiftEndTime,
+  lunchStartTime,
+  lunchEndTime,
+  maxWorkMinutes,
+  address,
+  isEarly = false,
+  earlyMinutes = 0,
+  submitting = false,
+  zIndex = 2147483646
+}) => {
+  const { t } = useLanguage();
+  const [isMobile, setIsMobile] = React.useState(() => typeof window !== 'undefined' && window.innerWidth <= 768);
+  const [isSuccess, setIsSuccess] = React.useState(false);
+  const [now, setNow] = React.useState<Date>(() => new Date());
+  const inFlightRef = React.useRef(false);
+  const onCloseRef = React.useRef(onClose);
+  const lockedRef = React.useRef(false);
+
+  onCloseRef.current = onClose;
+  lockedRef.current = Boolean(submitting || isSuccess);
+
+  React.useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  React.useEffect(() => {
+    if (!isOpen) {
+      setIsSuccess(false);
+      inFlightRef.current = false;
+      return;
+    }
+    setNow(new Date());
+    const timer = window.setInterval(() => {
+      setNow(new Date());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isOpen]);
+
+  const effectiveZIndex = Math.min(Math.max(2147483605, zIndex || 2147483646), 2147483646);
+
+  React.useEffect(() => {
+    if (!isOpen) return;
+    return pushOverlay('checkout-confirm-modal', () => {
+      if (!lockedRef.current && !inFlightRef.current) {
+        onCloseRef.current();
+      }
+    }, effectiveZIndex);
+  }, [isOpen, effectiveZIndex]);
+
+  const workPolicy = getTenantWorkPolicy();
+  const hrmWorkSchedule = useTypedSetting<Record<string, any>>('hrm.work_schedule_and_shifts', {});
+  const effectiveShiftStart = (shiftStartTime || hrmWorkSchedule?.work_start || workPolicy.global_work_start_time || '08:00').substring(0, 5);
+  const effectiveShiftEnd = (shiftEndTime || hrmWorkSchedule?.work_end || workPolicy.global_work_end_time || '17:00').substring(0, 5);
+  const effectiveLunchStart = (lunchStartTime || hrmWorkSchedule?.lunch_start || workPolicy.hrm_lunch_start_time || '12:00').substring(0, 5);
+  const effectiveLunchEnd = (lunchEndTime || hrmWorkSchedule?.lunch_end || workPolicy.hrm_lunch_end_time || '13:00').substring(0, 5);
+  const effectiveMaxWorkMin = Math.max(60, Number(maxWorkMinutes ?? hrmWorkSchedule?.workday_minutes ?? workPolicy.hrm_workday_minutes) || 480);
+
+  // Format current live time
+  const currentHM = now.toTimeString().substring(0, 5);
+  const currentDateStr = now.toLocaleDateString('vi-VN', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' });
+
+  // Calculate worked duration if checkInTime is available using live tenant policy lunch & workday bounds
+  let durationStr = '';
+  let lunchBreakDeductedMin = 0;
+  if (checkInTime) {
+    const inParts = checkInTime.substring(0, 5).split(':').map(Number);
+    if (inParts.length === 2 && !isNaN(inParts[0]) && !isNaN(inParts[1])) {
+      const inTotalMin = inParts[0] * 60 + inParts[1];
+      const curTotalMin = now.getHours() * 60 + now.getMinutes();
+
+      const shiftStartTotalMin = parseHmToMinutes(effectiveShiftStart, 8 * 60);
+      const shiftEndTotalMin = parseHmToMinutes(effectiveShiftEnd, 17 * 60);
+      const lunchStartMin = parseHmToMinutes(effectiveLunchStart, 12 * 60);
+      const lunchEndMin = parseHmToMinutes(effectiveLunchEnd, 13 * 60);
+
+      // Effective start & end clamped to shift boundaries
+      const effectiveInMin = Math.max(inTotalMin, shiftStartTotalMin);
+      const effectiveOutMin = Math.min(curTotalMin, shiftEndTotalMin);
+
+      const lunchOverlapMin = lunchEndMin > lunchStartMin
+        ? Math.max(0, Math.min(effectiveOutMin, lunchEndMin) - Math.max(effectiveInMin, lunchStartMin))
+        : 0;
+      lunchBreakDeductedMin = lunchOverlapMin;
+
+      // Net worked minutes within shift hours
+      const netDiff = Math.max(0, (effectiveOutMin - effectiveInMin) - lunchOverlapMin);
+
+      // Standard shift maximum capacity
+      const shiftLunchOverlap = lunchEndMin > lunchStartMin
+        ? Math.max(0, Math.min(shiftEndTotalMin, lunchEndMin) - Math.max(shiftStartTotalMin, lunchStartMin))
+        : 0;
+      const maxShiftDurationMin = Math.max(0, (shiftEndTotalMin - shiftStartTotalMin) - shiftLunchOverlap);
+
+      const finalWorkMin = Math.min(netDiff, maxShiftDurationMin > 0 ? maxShiftDurationMin : effectiveMaxWorkMin);
+
+      const h = Math.floor(finalWorkMin / 60);
+      const m = finalWorkMin % 60;
+      durationStr = `${h}h ${m < 10 ? '0' : ''}${m}m`;
+    }
+  }
+  void lunchBreakDeductedMin;
+
+  const handleConfirmAction = async () => {
+    if (submitting || isSuccess || inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+      const res = await onConfirm();
+      if (res === true) {
+        setIsSuccess(true);
+        triggerFullConfetti();
+      }
+    } catch (e) {
+      console.error('Error during checkout confirmation:', e);
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const modalContent = (
+    <AnimatePresence>
+      {isOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(15, 23, 42, 0.72)',
+            backdropFilter: 'blur(6px)',
+            WebkitBackdropFilter: 'blur(6px)',
+            zIndex: effectiveZIndex,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: isMobile ? '1rem' : '1.5rem'
+          }}
+          onClick={submitting || isSuccess ? undefined : onClose}
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96, y: 12 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 12 }}
+            transition={{ duration: 0.22, ease: [0.25, 0.1, 0.25, 1] }}
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--color-surface, #ffffff)',
+              width: '100%',
+              maxWidth: '470px',
+              borderRadius: '16px',
+              boxShadow: '0 25px 50px -12px rgba(15, 23, 42, 0.28)',
+              border: '1px solid #E2E8F0',
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              position: 'relative'
+            }}
+          >
+            {/* Close button */}
+            {!isSuccess && (
+              <button
+                type="button"
+                onClick={submitting ? undefined : onClose}
+                disabled={submitting}
+                style={{
+                  position: 'absolute',
+                  top: '16px',
+                  right: '16px',
+                  border: '1px solid #E2E8F0',
+                  background: '#F8FAFC',
+                  color: '#64748B',
+                  cursor: submitting ? 'not-allowed' : 'pointer',
+                  padding: '6px',
+                  borderRadius: '50%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  transition: 'all 0.15s ease',
+                  zIndex: 10,
+                  opacity: submitting ? 0.4 : 1
+                }}
+                title={t('Đóng')}
+              >
+                <X size={16} />
+              </button>
+            )}
+
+            {isSuccess ? (
+              /* Success Celebration Screen */
+              <div
+                style={{
+                  padding: isMobile ? '2.5rem 1.25rem' : '3rem 2rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  textAlign: 'center',
+                  gap: '1.25rem',
+                  position: 'relative',
+                  overflow: 'hidden'
+                }}
+              >
+                <div style={{ position: 'relative', width: 88, height: 88, display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '4px 0' }}>
+                  <div
+                    className="checkin-success-badge"
+                    style={{
+                      width: 80,
+                      height: 80,
+                      borderRadius: '50%',
+                      background: '#10B981',
+                      color: '#ffffff',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      border: '2px solid #ffffff',
+                      zIndex: 2
+                    }}
+                  >
+                    <CheckCircle2 size={44} strokeWidth={2.2} />
+                  </div>
+                </div>
+
+                {/* Pill & Title */}
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '8px' }}>
+                  <div
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '4px 12px',
+                      borderRadius: '6px',
+                      background: 'rgba(16, 185, 129, 0.1)',
+                      color: '#059669',
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                      letterSpacing: '0.04em',
+                      textTransform: 'uppercase'
+                    }}
+                  >
+                    <CheckCircle2 size={13} strokeWidth={1.75} />
+                    <span>{t('HOÀN THÀNH CA LÀM VIỆC')}</span>
+                  </div>
+
+                  <h2
+                    style={{
+                      fontSize: isMobile ? '1.3rem' : '1.45rem',
+                      fontWeight: 700,
+                      color: 'var(--color-text, #0f172a)',
+                      margin: 0,
+                      lineHeight: 1.3
+                    }}
+                  >
+                    {t('Chấm công ra ca thành công')}
+                  </h2>
+
+                  <p
+                    style={{
+                      fontSize: '0.875rem',
+                      color: 'var(--color-text-muted, #64748b)',
+                      margin: '4px auto 0 auto',
+                      maxWidth: '360px',
+                      lineHeight: 1.55
+                    }}
+                  >
+                    {t('Đã ghi nhận giờ ra ca. Hẹn gặp lại bạn vào ca làm việc tiếp theo.')}
+                  </p>
+                </div>
+
+                {/* Stats Summary Card */}
+                <div
+                  style={{
+                    width: '100%',
+                    maxWidth: '380px',
+                    background: 'var(--color-bg, #f8fafc)',
+                    border: '1px solid var(--color-border-light, rgba(0,0,0,0.08))',
+                    borderRadius: '12px',
+                    padding: '12px 16px',
+                    display: 'flex',
+                    justifyContent: 'space-around',
+                    alignItems: 'center'
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted, #64748b)', fontWeight: 600 }}>{t('Giờ ra ca')}</span>
+                    <span style={{ fontSize: '1.15rem', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: '#059669' }}>{currentHM}</span>
+                  </div>
+                  {durationStr && (
+                    <>
+                      <div style={{ width: 1, height: 26, background: 'var(--color-border-light, rgba(0,0,0,0.1))' }} />
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px' }}>
+                        <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted, #64748b)', fontWeight: 600 }}>{t('Thời gian làm việc')}</span>
+                        <span style={{ fontSize: '1.15rem', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: '#0F172A' }}>{durationStr}</span>
+                      </div>
+                    </>
+                  )}
+                  <div style={{ width: 1, height: 26, background: 'var(--color-border-light, rgba(0,0,0,0.1))' }} />
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '3px' }}>
+                    <span style={{ fontSize: '0.7rem', color: 'var(--color-text-muted, #64748b)', fontWeight: 600 }}>{t('Trạng thái')}</span>
+                    <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#10b981', display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <CheckCircle2 size={14} /> {t('Hợp lệ')}
+                    </span>
+                  </div>
+                </div>
+
+                {/* 2.2s Animated Countdown Progress Bar */}
+                <div style={{ width: '100%', maxWidth: '240px', height: 4, background: 'var(--color-border-light, rgba(0,0,0,0.08))', borderRadius: 99, overflow: 'hidden', margin: '0.25rem auto 0 auto' }}>
+                  <div 
+                    className="checkin-progress-bar" 
+                    style={{ 
+                      height: '100%', 
+                      background: '#10b981', 
+                      borderRadius: 99, 
+                      animation: 'checkin-progress-fill 2.2s linear forwards' 
+                    }} 
+                  />
+                </div>
+              </div>
+            ) : (
+              <>
+                {/* Modal Body */}
+                <div style={{ padding: isMobile ? '1.5rem 1.25rem' : '2rem 1.75rem', display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+              
+              {/* Header: Icon badge & Title */}
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', gap: '0.75rem' }}>
+                <div
+                  style={{
+                    position: 'relative',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 60,
+                      height: 60,
+                      borderRadius: '12px',
+                      background: 'rgba(189, 29, 45, 0.08)',
+                      border: '1px solid rgba(189, 29, 45, 0.2)',
+                      color: '#BD1D2D',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center'
+                    }}
+                  >
+                    <LogOut size={28} strokeWidth={1.75} />
+                  </div>
+                </div>
+
+                <div>
+                  <div
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 5,
+                      padding: '3px 10px',
+                      borderRadius: '20px',
+                      background: 'rgba(239, 68, 68, 0.08)',
+                      color: '#BD1D2D',
+                      fontSize: '0.6875rem',
+                      fontWeight: 800,
+                      letterSpacing: '0.05em',
+                      textTransform: 'uppercase',
+                      marginBottom: '6px'
+                    }}
+                  >
+                    {t('KẾT THÚC CA LÀM VIỆC')}
+                  </div>
+                  <h3
+                    style={{
+                      fontSize: '1.25rem',
+                      fontWeight: 800,
+                      color: 'var(--color-text, #0f172a)',
+                      margin: 0,
+                      letterSpacing: '-0.02em',
+                      lineHeight: 1.3
+                    }}
+                  >
+                    {t('Xác nhận Chấm công Ra ca')}
+                  </h3>
+                  <p
+                    style={{
+                      fontSize: '0.8125rem',
+                      color: 'var(--color-text-muted, #64748b)',
+                      margin: '4px 0 0 0'
+                    }}
+                  >
+                    {currentDateStr}
+                  </p>
+                </div>
+              </div>
+
+              {/* Employee & Photo Preview Bar */}
+              <div
+                style={{
+                  background: 'var(--color-bg, #f8fafc)',
+                  border: '1px solid var(--color-border-light, rgba(0,0,0,0.06))',
+                  borderRadius: '16px',
+                  padding: '12px 14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '12px'
+                }}
+              >
+                {/* Photo Thumbnail */}
+                <div style={{ position: 'relative', width: 50, height: 50, flexShrink: 0 }}>
+                  {capturedImage ? (
+                    <img
+                      src={capturedImage}
+                      alt="Check-out face"
+                      style={{
+                        width: 50,
+                        height: 50,
+                        borderRadius: '14px',
+                        objectFit: 'cover',
+                        border: '2px solid rgba(16, 185, 129, 0.5)',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.1)'
+                      }}
+                    />
+                  ) : (
+                    <div
+                      style={{
+                        width: 50,
+                        height: 50,
+                        borderRadius: '14px',
+                        background: '#F1F5F9',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#64748b',
+                        fontWeight: 700,
+                        fontSize: '1.1rem'
+                      }}
+                    >
+                      {userName ? userName.charAt(0).toUpperCase() : 'U'}
+                    </div>
+                  )}
+
+                  {/* Verified checkmark badge */}
+                  <div
+                    style={{
+                      position: 'absolute',
+                      bottom: -3,
+                      right: -3,
+                      width: 18,
+                      height: 18,
+                      borderRadius: '50%',
+                      background: '#10b981',
+                      color: '#ffffff',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      border: '2px solid #ffffff',
+                      boxShadow: '0 2px 4px rgba(0,0,0,0.15)'
+                    }}
+                  >
+                    <CheckCircle2 size={12} strokeWidth={3} />
+                  </div>
+                </div>
+
+                {/* Name & Role */}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div
+                    style={{
+                      fontWeight: 700,
+                      fontSize: '0.9375rem',
+                      color: 'var(--color-text, #0f172a)',
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis'
+                    }}
+                  >
+                    {userName || t('Nhân viên')}
+                  </div>
+                  <div
+                    style={{
+                      fontSize: '0.75rem',
+                      color: 'var(--color-text-muted, #64748b)',
+                      marginTop: '2px'
+                    }}
+                  >
+                    {userRole || t('Văn phòng')} • {t('Nhận diện khuôn mặt hợp lệ')}
+                  </div>
+                </div>
+              </div>
+
+              {/* Shift Stats Card */}
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr',
+                  gap: '10px'
+                }}
+              >
+                {/* Giờ vào ca */}
+                <div
+                  style={{
+                    background: 'var(--color-bg, #f8fafc)',
+                    border: '1px solid var(--color-border-light, rgba(0,0,0,0.06))',
+                    borderRadius: '14px',
+                    padding: '10px 12px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '4px'
+                  }}
+                >
+                  <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted, #64748b)', fontWeight: 600 }}>
+                    {t('Giờ vào ca')}
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981' }} />
+                    <span style={{ fontSize: '1.05rem', fontWeight: 800, color: '#059669', letterSpacing: '-0.02em' }}>
+                      {checkInTime ? checkInTime.substring(0, 5) : '--:--'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Giờ ra ca */}
+                <div
+                  style={{
+                    background: 'var(--color-bg, #f8fafc)',
+                    border: '1px solid var(--color-border-light, rgba(0,0,0,0.06))',
+                    borderRadius: '14px',
+                    padding: '10px 12px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '4px'
+                  }}
+                >
+                  <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted, #64748b)', fontWeight: 600 }}>
+                    {t('Giờ ra ca (Ghi nhận)')}
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        background: '#ef4444',
+                        animation: 'pulse 1.5s infinite'
+                      }}
+                    />
+                    <span style={{ fontSize: '1.05rem', fontWeight: 800, color: '#BD1D2D', letterSpacing: '-0.02em' }}>
+                      {currentHM}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Working Duration & Early Checkout Warning */}
+              {durationStr && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '8px 14px',
+                    borderRadius: '12px',
+                    background: isEarly ? 'rgba(245, 158, 11, 0.08)' : 'rgba(16, 185, 129, 0.08)',
+                    border: isEarly ? '1px solid rgba(245, 158, 11, 0.2)' : '1px solid rgba(16, 185, 129, 0.2)',
+                    fontSize: '0.8125rem'
+                  }}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: isEarly ? '#b45309' : '#047857', fontWeight: 600 }}>
+                    <Clock size={14} />
+                    <span>{t('Thời gian làm việc ca này:')}</span>
+                  </span>
+                  <span style={{ fontWeight: 800, color: isEarly ? '#b45309' : '#047857' }}>
+                    {durationStr}
+                  </span>
+                </div>
+              )}
+
+              {/* Early Alert if leaving before shift end */}
+              {isEarly && earlyMinutes > 0 && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 8,
+                    padding: '10px 12px',
+                    borderRadius: '12px',
+                    background: 'rgba(239, 68, 68, 0.06)',
+                    border: '1px solid rgba(239, 68, 68, 0.18)',
+                    fontSize: '0.78125rem',
+                    color: '#b91c1c',
+                    lineHeight: 1.45
+                  }}
+                >
+                  <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <div>
+                    {t('Bạn đang ra ca sớm')} <strong>{earlyMinutes} {t('phút')}</strong> {t('trước giờ quy định')} ({effectiveShiftEnd}). {t('Thời gian ra ca sớm sẽ được lưu vào lịch sử công.')}
+                  </div>
+                </div>
+              )}
+
+              {/* GPS Location (if provided) */}
+              {address && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    fontSize: '0.75rem',
+                    color: 'var(--color-text-muted, #64748b)',
+                    padding: '0 2px'
+                  }}
+                >
+                  <MapPin size={13} style={{ flexShrink: 0, color: '#BD1D2D' }} />
+                  <span
+                    style={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap'
+                    }}
+                    title={address}
+                  >
+                    {address}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Action Buttons Footer */}
+            <div
+              style={{
+                padding: isMobile ? '1rem 1.25rem' : '1.25rem 1.75rem',
+                background: 'var(--color-surface-hover, #f8fafc)',
+                borderTop: '1px solid #E2E8F0',
+                display: 'flex',
+                gap: '10px',
+                justifyContent: 'flex-end'
+              }}
+            >
+              <button
+                type="button"
+                className="btn outline"
+                disabled={submitting}
+                onClick={onClose}
+                style={{
+                  flex: isMobile ? 1 : 'none',
+                  padding: '10px 18px',
+                  borderRadius: '10px',
+                  fontWeight: 600,
+                  fontSize: '0.875rem',
+                  border: '1px solid #CBD5E1',
+                  background: '#FFFFFF',
+                  color: '#334155',
+                  cursor: submitting ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.15s ease'
+                }}
+              >
+                {t('Tiếp tục làm việc')}
+              </button>
+
+              <button
+                type="button"
+                className="btn primary"
+                disabled={submitting}
+                onClick={handleConfirmAction}
+                style={{
+                  flex: isMobile ? 1 : 'none',
+                  padding: '10px 24px',
+                  borderRadius: '10px',
+                  fontWeight: 700,
+                  fontSize: '0.875rem',
+                  border: 'none',
+                  background: '#BD1D2D',
+                  color: '#ffffff',
+                  boxShadow: '0 2px 8px rgba(189, 29, 45, 0.25)',
+                  cursor: submitting ? 'not-allowed' : 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  transition: 'all 0.2s ease',
+                  opacity: submitting ? 0.7 : 1
+                }}
+              >
+                {submitting ? (
+                  <>
+                    <RefreshCw size={15} className="spin" />
+                    <span>{t('Đang ra ca...')}</span>
+                  </>
+                ) : (
+                  <>
+                    <LogOut size={16} />
+                    <span>{t('Xác nhận Ra ca ngay')}</span>
+                  </>
+                )}
+              </button>
+            </div>
+            </>
+          )}
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+
+  return typeof document !== 'undefined' ? createPortal(modalContent, document.body) : null;
+};

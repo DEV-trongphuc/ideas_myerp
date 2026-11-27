@@ -1,0 +1,1237 @@
+import React, { useState, useRef } from 'react';
+import { 
+  Sparkles, Check, X, Loader2, DollarSign, 
+  CheckSquare, User, ExternalLink, AlertCircle, Clock,
+  Package, FileText, FileSpreadsheet, Download, ClipboardList
+} from 'lucide-react';
+import toast from 'react-hot-toast';
+import { useNavigate } from 'react-router-dom';
+import api from '../../api/axios';
+import { downloadExportFile } from '../../utils/exportHelper';
+import { useUIStore } from '../../store/uiStore';
+import { useAuthStore } from '../../store/authStore';
+import { useChatStore } from '../../store/chatStore';
+import { Avatar } from '../ui/Avatar';
+import { safeParseJson, normalizeActionProposal } from './chatTagParsers';
+
+export interface ActionProposal {
+  action_type: 'leave' | 'expense' | 'task' | 'lead' | 'sales_order' | 'deposit' | 'supplementary' | 'advance_payment' | 'inventory_receipt' | 'shift_swap' | 'admission_document_request' | 'legal_contract' | 'asset_handover' | 'marketing_campaign' | 'automation_flow' | 'voucher_issue' | 'sync_match_only' | 'ticket' | 'quote' | 'deal' | 'export_data' | 'export' | (string & {});
+  title: string;
+  params: Record<string, any>;
+  summary: string;
+}
+
+const activeProposalByFamily = new Map<string, string>();
+
+function getActionFamily(actionType: string): string {
+  if (actionType === 'advance_payment' || actionType === 'expense') return 'expense';
+  if (actionType === 'supplementary' || actionType === 'leave' || actionType === 'shift_swap' || actionType === 'attendance') return 'attendance';
+  if (actionType === 'sales_order' || actionType === 'deposit') return 'deposit';
+  if (actionType === 'CREATE_TASK' || actionType === 'task') return 'task';
+  return actionType;
+}
+
+export const parseActionProposal = (content: string): { cleanContent: string; proposal: ActionProposal | null } => {
+  if (!content) return { cleanContent: '', proposal: null };
+  const match =
+    content.match(/<<<ACTION_PROPOSAL:\s*({[\s\S]*?})\s*>>>/) ||
+    content.match(/\[\[ACTION_PROPOSAL:\s*({[\s\S]*?})\s*\]\]/);
+  if (!match) return { cleanContent: content, proposal: null };
+
+  const cleanContent = content.replace(match[0], '').trim();
+  const raw = safeParseJson<any>(match[1]);
+  const normalized = normalizeActionProposal(raw);
+  if (normalized) {
+    return { cleanContent, proposal: normalized };
+  }
+
+  // Robust fallback: regex extraction if JSON was heavily malformed
+  const typeMatch = match[1].match(/"action_type"\s*:\s*"([^"]+)"/);
+  if (typeMatch) {
+    const actionType = typeMatch[1] as ActionProposal['action_type'];
+    const summaryMatch = match[1].match(/"summary"\s*:\s*"([^"]+)"/);
+    const reasonMatch = match[1].match(/"reason"\s*:\s*"([^"]+)"/);
+    const startDateMatch = match[1].match(/"start_date"\s*:\s*"([^"]+)"/);
+    const endDateMatch = match[1].match(/"end_date"\s*:\s*"([^"]+)"/);
+    const todayLocal = new Date().toLocaleDateString('sv-SE');
+    return {
+      cleanContent,
+      proposal: {
+        action_type: actionType,
+        title: actionType === 'leave' ? 'Đề xuất nghỉ phép' : 'Đề xuất hành động ERP',
+        summary: summaryMatch ? summaryMatch[1] : 'Đề xuất từ AI IDEAS',
+        params: {
+          leave_type: 'unpaid',
+          start_date: startDateMatch ? startDateMatch[1] : todayLocal,
+          end_date: endDateMatch ? endDateMatch[1] : todayLocal,
+          total_days: 1,
+          reason: reasonMatch ? reasonMatch[1] : 'Việc cá nhân'
+        }
+      }
+    };
+  }
+  return { cleanContent, proposal: null };
+};
+
+interface ActionProposalCardProps {
+  proposal: ActionProposal;
+  messageId: number | string;
+  proposalIndex?: number;
+  onExecuted?: (actionType: string, resultData: any) => void;
+}
+
+export const ActionProposalCard: React.FC<ActionProposalCardProps> = ({
+  proposal,
+  messageId,
+  proposalIndex = 0,
+  onExecuted
+}) => {
+  const navigate = useNavigate();
+  const proposalInstanceId = `${messageId}_${proposal.action_type}_${proposalIndex}`;
+  const persistedOutcome = useChatStore((s) => s.proposalOutcomesByKey?.[proposalInstanceId]);
+  const recordProposalOutcome = useChatStore((s) => s.recordProposalOutcome);
+
+  const [status, setStatus] = useState<'idle' | 'submitting' | 'success' | 'cancelled' | 'error'>(
+    () => persistedOutcome?.status || 'idle'
+  );
+  const [resultId, setResultId] = useState<number | string | null>(
+    () => persistedOutcome?.resultId ?? null
+  );
+  const [errorMsg, setErrorMsg] = useState<string>('');
+  const inFlightRef = useRef(false);
+  const isTriggeredLocallyRef = useRef(false);
+
+  React.useEffect(() => {
+    if (persistedOutcome && status === 'idle') {
+      setStatus(persistedOutcome.status);
+      if (persistedOutcome.resultId !== undefined) {
+        setResultId(persistedOutcome.resultId ?? null);
+      }
+    }
+  }, [persistedOutcome, status]);
+
+  // Bi-directional event bus: listen for form completions from background Drawers/Modals
+  React.useEffect(() => {
+    const family = getActionFamily(proposal.action_type);
+
+    const handleActionCompleted = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      const detail = customEvent.detail;
+      if (!detail) return;
+
+      const eventFamily = getActionFamily(String(detail.actionType || ''));
+      const matchedExplicitId = detail.proposalId && detail.proposalId === proposalInstanceId;
+      const matchedScopedTrigger =
+        !detail.proposalId &&
+        isTriggeredLocallyRef.current &&
+        activeProposalByFamily.get(family) === proposalInstanceId &&
+        eventFamily === family;
+
+      if (!matchedExplicitId && !matchedScopedTrigger) {
+        return;
+      }
+
+      const nextResultId = detail.id ?? detail.entityId ?? null;
+      isTriggeredLocallyRef.current = false;
+      if (activeProposalByFamily.get(family) === proposalInstanceId) {
+        activeProposalByFamily.delete(family);
+      }
+      setStatus('success');
+      if (nextResultId) setResultId(nextResultId);
+      recordProposalOutcome(proposalInstanceId, 'success', nextResultId);
+    };
+
+    const handleTaskUpdated = (e: Event) => {
+      if (family !== 'task') return;
+      const detail = (e as CustomEvent)?.detail;
+      if (!detail) return;
+      const matchedExplicitId = detail.proposalId && detail.proposalId === proposalInstanceId;
+      const matchedScopedTrigger =
+        !detail.proposalId &&
+        isTriggeredLocallyRef.current &&
+        activeProposalByFamily.get('task') === proposalInstanceId;
+      if (!matchedExplicitId && !matchedScopedTrigger) return;
+      const nextResultId = detail.id ?? null;
+      isTriggeredLocallyRef.current = false;
+      if (activeProposalByFamily.get('task') === proposalInstanceId) {
+        activeProposalByFamily.delete('task');
+      }
+      setStatus('success');
+      if (nextResultId) setResultId(nextResultId);
+      recordProposalOutcome(proposalInstanceId, 'success', nextResultId);
+    };
+
+    window.addEventListener('erp-action-completed', handleActionCompleted);
+    window.addEventListener('task-updated', handleTaskUpdated);
+    return () => {
+      window.removeEventListener('erp-action-completed', handleActionCompleted);
+      window.removeEventListener('task-updated', handleTaskUpdated);
+    };
+  }, [proposal.action_type, proposalInstanceId, recordProposalOutcome]);
+
+  const handleOpenAndPrefill = async () => {
+    if (inFlightRef.current || status === 'submitting' || status === 'success' || status === 'cancelled') return;
+    inFlightRef.current = true;
+    setErrorMsg('');
+    const family = getActionFamily(proposal.action_type);
+    isTriggeredLocallyRef.current = true;
+    activeProposalByFamily.set(family, proposalInstanceId);
+
+    try {
+      const p = proposal.params || {};
+
+      switch (proposal.action_type) {
+        case 'expense': {
+          window.dispatchEvent(new CustomEvent('open-expense-create-drawer', {
+            detail: {
+              proposalId: proposalInstanceId,
+              title: p.title || 'Đề xuất thanh toán',
+              amount: Number(p.amount) || 0,
+              category: p.category || 'general',
+              notes: p.notes || p.reason || '',
+              approver_id: p.approver_id,
+              approver_id_2: p.approver_id_2,
+              approver_id_3: p.approver_id_3,
+              due_date: p.due_date || '',
+              vat_amount: p.vat_amount !== undefined ? Number(p.vat_amount) : undefined,
+              has_vat_invoice: p.has_vat_invoice !== undefined ? Boolean(p.has_vat_invoice) : undefined,
+              is_vat_inclusive: p.is_vat_inclusive !== undefined ? Boolean(p.is_vat_inclusive) : undefined,
+              items: Array.isArray(p.items) ? p.items : undefined,
+              entities: Array.isArray(p.entities) ? p.entities : undefined,
+              bank_name: p.bank_name || '',
+              bank_account: p.bank_account || '',
+              bank_holder: p.bank_holder || '',
+              vendor_name: p.vendor_name || ''
+            }
+          }));
+          toast.success('Đã mở Đề xuất chi và điền sẵn thông tin! Bạn hãy kiểm tra lại và bấm Lưu nhé.');
+          break;
+        }
+
+        case 'sales_order': {
+          let contactId = p.contact_id || p.customer_id || p.id || null;
+          const phone = p.contact_phone || p.phone || p['SĐT'] || p['sdt'] || p['so_dien_thoai'] || '';
+          const email = p.contact_email || p.email || p['Email'] || '';
+          const fullName = p.contact_name || p.customer_name || p.name || p.full_name || p['Họ và tên'] || '';
+
+          // If contact_id is missing, attempt to lookup contact by phone/email/name from CRM
+          if (!contactId && (phone || email || fullName)) {
+            try {
+              const searchQ = phone || email || fullName;
+              const res = await api.get('/contacts', { params: { search: searchQ } });
+              const list = Array.isArray(res.data) ? res.data : (res.data?.data?.items || res.data?.data || res.data?.items || []);
+              if (list.length > 0) {
+                const cleanPhone = String(phone).replace(/\D/g, '');
+                const matched = list.find((c: any) => {
+                  const cPhone = String(c.phone || '').replace(/\D/g, '');
+                  if (cleanPhone && cPhone && (cPhone.includes(cleanPhone) || cleanPhone.includes(cPhone))) return true;
+                  if (email && c.email && String(c.email).toLowerCase() === String(email).toLowerCase()) return true;
+                  return false;
+                }) || list[0];
+                if (matched && matched.id) {
+                  contactId = matched.id;
+                }
+              }
+            } catch (err) {
+              console.warn('Auto contact lookup error:', err);
+            }
+          }
+
+          // Format milestones / installments cleanly
+          const rawList = p.installments || p.milestones || p.items || p.schedule || [];
+          let mappedMilestones: any[] | undefined = undefined;
+
+          if (Array.isArray(rawList) && rawList.length > 0) {
+            mappedMilestones = rawList.map((it: any, idx: number) => {
+              const name = it.name || it.title || it.label || `Đợt ${idx + 1}`;
+              const amount = String(it.amount || it.price || it.unit_price || '');
+
+              let payDate = it.date || it.expected_pay_date || it.pay_date || '';
+              if (payDate && /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(payDate)) {
+                const parts = payDate.split('/');
+                payDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+              }
+              if (!payDate || isNaN(new Date(payDate).getTime())) {
+                payDate = new Date().toLocaleDateString('sv-SE');
+              }
+
+              return {
+                name,
+                amount,
+                expected_pay_date: payDate
+              };
+            });
+          }
+
+          const totalAmount = p.total || p.amount || p.total_amount_VND || p.total_amount || p['Tổng tiền'] || '';
+
+          useUIStore.getState().setShowPOS({
+            id: contactId && Number(contactId) > 0 ? Number(contactId) : 0,
+            proposalId: proposalInstanceId,
+            full_name: fullName || 'Khách hàng',
+            phone: phone || '',
+            email: email || '',
+            price: totalAmount ? String(totalAmount) : '',
+            notes: p.notes || p.description || 'Khởi tạo từ AI IDEAS Agent',
+            milestones: mappedMilestones,
+            projectId: p.project_id || p.course_id || p.program_id || '',
+            unit_code: p.unit_code || '',
+            expected_commission: p.expected_commission !== undefined ? String(p.expected_commission) : undefined,
+            accountant_id: p.accountant_id ? Number(p.accountant_id) : undefined,
+            participant_ids: p.participant_ids || '',
+            exchange_rate: p.exchange_rate !== undefined ? Number(p.exchange_rate) : undefined,
+            currency: p.currency || 'VND'
+          });
+          toast.success('Đã mở Phiếu thu/Đơn hàng (SO) và điền sẵn thông tin! Bạn hãy kiểm tra và lưu nhé.');
+          break;
+        }
+
+        case 'deposit': {
+          let contactId = p.contact_id || p.customer_id || p.id || null;
+          const phone = p.contact_phone || p.phone || p['SĐT'] || p['sdt'] || '';
+          const email = p.contact_email || p.email || '';
+          const fullName = p.contact_name || p.customer_name || p.name || p.full_name || '';
+
+          if (!contactId && (phone || email || fullName)) {
+            try {
+              const searchQ = phone || email || fullName;
+              const res = await api.get('/contacts', { params: { search: searchQ } });
+              const list = Array.isArray(res.data) ? res.data : (res.data?.data?.items || res.data?.data || res.data?.items || []);
+              if (list.length > 0) {
+                const cleanPhone = String(phone).replace(/\D/g, '');
+                const matched = list.find((c: any) => {
+                  const cPhone = String(c.phone || '').replace(/\D/g, '');
+                  if (cleanPhone && cPhone && (cPhone.includes(cleanPhone) || cleanPhone.includes(cPhone))) return true;
+                  if (email && c.email && String(c.email).toLowerCase() === String(email).toLowerCase()) return true;
+                  return false;
+                }) || list[0];
+                if (matched && matched.id) {
+                  contactId = matched.id;
+                }
+              }
+            } catch (err) {
+              console.warn('Auto contact lookup error:', err);
+            }
+          }
+
+          const depositAmount = p.amount || p.deposit_amount || p.price || p.total || p.total_amount || '';
+
+          useUIStore.getState().setShowPOS({
+            id: contactId && Number(contactId) > 0 ? Number(contactId) : 0,
+            proposalId: proposalInstanceId,
+            full_name: fullName || 'Học viên',
+            phone: phone || '',
+            email: email || '',
+            price: depositAmount ? String(depositAmount) : '',
+            notes: p.notes || p.description || 'Phiếu đặt cọc/giữ chỗ từ AI IDEAS Agent',
+            projectId: p.project_id || p.course_id || p.program_id || '',
+            unit_code: p.unit_code || '',
+            expected_commission: p.expected_commission !== undefined ? String(p.expected_commission) : undefined,
+            accountant_id: p.accountant_id ? Number(p.accountant_id) : undefined,
+            participant_ids: p.participant_ids || '',
+            exchange_rate: p.exchange_rate !== undefined ? Number(p.exchange_rate) : undefined,
+            currency: p.currency || 'VND'
+          });
+          toast.success('Đã mở Phiếu Đặt Cọc / Giữ Chỗ và điền sẵn thông tin! Bạn hãy kiểm tra và bấm Lưu nhé.');
+          break;
+        }
+
+        case 'task': {
+          const currentUser = useAuthStore.getState().user;
+          let targetUserId = p.user_id ? Number(p.user_id) : undefined;
+          let targetUserName = p.assignee_name || p.user_name || undefined;
+
+          // Smart assignee resolution if user_id is missing but a name is mentioned
+          if (!targetUserId) {
+            const staffList = useChatStore.getState().staffDirectory || [];
+            const searchTarget = (p.assignee_name || p.assignee || p.user || '').toLowerCase().trim();
+            if (searchTarget) {
+              const matched = staffList.filter(s => s.full_name?.toLowerCase().includes(searchTarget));
+              if (matched.length === 1) {
+                targetUserId = matched[0].id;
+                targetUserName = matched[0].full_name;
+              }
+            } else {
+              // Check if subject, body or summary mentions "giao cho [Tên]"
+              const fullText = `${p.subject || ''} ${p.body || ''} ${proposal.summary || ''} ${proposal.title || ''}`;
+              const m = fullText.match(/giao cho\s+([a-zA-Z0-9_\u00C0-\u1EF9\s]+?)(?:\s+mai|\s+làm|\s+cập nhật|\s+hạn|\.|\,|$)/i);
+              if (m && m[1]) {
+                const cName = m[1].trim().toLowerCase();
+                const matched = staffList.filter(s => s.full_name?.toLowerCase().includes(cName));
+                if (matched.length === 1) {
+                  targetUserId = matched[0].id;
+                  targetUserName = matched[0].full_name;
+                }
+              }
+            }
+          }
+
+          const targetContactId = p.contact_id || p.customer_id || p.student_id || p.lead_id || (p.related_type === 'contact' ? p.related_id : undefined);
+          const targetContactName = p.contact_name || p.customer_name || p.student_name || p.lead_name || '';
+
+          useUIStore.getState().openTaskDrawer({
+            id: 'new',
+            proposalId: proposalInstanceId,
+            subject: p.subject || p.title || 'Công việc mới từ AI IDEAS',
+            due_date: p.due_date || p.deadline || new Date().toLocaleDateString('sv-SE'),
+            priority: p.priority || 'medium',
+            body: p.body || p.description || '',
+            user_id: targetUserId,
+            user_name: targetUserName,
+            assignee_name: targetUserName,
+            created_by: currentUser?.id,
+            created_by_id: currentUser?.id,
+            created_by_name: currentUser?.full_name || 'Tôi',
+            created_by_avatar: currentUser?.avatar_url,
+            participant_ids: p.participant_ids || (p.collaborator_ids ? (Array.isArray(p.collaborator_ids) ? p.collaborator_ids.join(',') : String(p.collaborator_ids)) : ''),
+            collaborator_ids: Array.isArray(p.collaborator_ids) ? p.collaborator_ids : (p.collaborator_ids ? String(p.collaborator_ids).split(',') : []),
+            team_id: p.team_id ? Number(p.team_id) : undefined,
+            contact_id: targetContactId ? Number(targetContactId) : undefined,
+            contact_name: targetContactName || undefined,
+            related_type: targetContactId ? 'contact' : (p.related_type || undefined),
+            related_id: targetContactId ? Number(targetContactId) : (p.related_id ? Number(p.related_id) : undefined),
+            from_customer_drawer: Boolean(targetContactId)
+          });
+          toast.success('Đã mở Công việc (Task) và điền sẵn thông tin');
+          break;
+        }
+
+        case 'lead': {
+          const leadName = p.name || p.full_name || p.contact_name || '';
+          window.dispatchEvent(new CustomEvent('open-quick-add-lead', {
+            detail: {
+              proposalId: proposalInstanceId,
+              name: leadName,
+              full_name: leadName,
+              phone: p.phone || '',
+              email: p.email || '',
+              company: p.company || '',
+              source: p.source || (p.is_personal ? 'ca_nhan' : ''),
+              program: p.program || p.type || '',
+              type: p.program || p.type || '',
+              notes: p.notes || p.description || '',
+              owner_id: p.owner_id || p.assigned_to || p.target_owner_id || '',
+              assignee_name: p.assignee_name || p.owner_name || p.target_owner_name || '',
+              distribution_mode: p.distribution_mode || (p.is_personal ? 'self_assign' : (p.owner_id || p.assigned_to || p.target_owner_id ? 'direct_assign' : '')),
+              is_personal: Boolean(p.is_personal),
+              bulk_leads: Array.isArray(p.bulk_leads) ? p.bulk_leads : undefined,
+            }
+          }));
+          toast.success('Đã mở Form thêm học viên và điền sẵn thông tin');
+          break;
+        }
+
+        case 'leave': {
+          const todayLocal = new Date().toLocaleDateString('sv-SE');
+          const leaveDetail = {
+            proposalId: proposalInstanceId,
+            createLeaveType: 'leave',
+            leave_type: p.leave_type || 'annual',
+            start_date: p.start_date || p.from_date || todayLocal,
+            end_date: p.end_date || p.to_date || todayLocal,
+            total_days: Number(p.total_days) || 1,
+            reason: p.reason || 'Đăng ký qua trợ lý AI IDEAS',
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_leave_draft', JSON.stringify(leaveDetail));
+          window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: leaveDetail }));
+          if (!window.location.pathname.startsWith('/attendance')) {
+            navigate('/attendance?action=create-leave');
+          }
+          setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: leaveDetail }));
+          }, 120);
+          toast.success('Đã mở Đơn xin nghỉ phép và điền sẵn thông tin');
+          break;
+        }
+
+        case 'supplementary': {
+          const todayLocal = new Date().toLocaleDateString('sv-SE');
+          const suppDetail = {
+            proposalId: proposalInstanceId,
+            createLeaveType: 'supplementary',
+            date: p.date || todayLocal,
+            in_time: p.in_time || '08:00',
+            out_time: p.out_time || '17:00',
+            reason: p.reason || p.notes || 'Quên chấm công (Đề xuất qua AI IDEAS)',
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_leave_draft', JSON.stringify(suppDetail));
+          window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: suppDetail }));
+          if (!window.location.pathname.startsWith('/attendance')) {
+            navigate('/attendance?action=create-leave');
+          }
+          setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: suppDetail }));
+          }, 120);
+          toast.success('Đã mở Đơn giải trình bổ sung công và điền sẵn thông tin');
+          break;
+        }
+
+        case 'advance_payment': {
+          window.dispatchEvent(new CustomEvent('open-expense-create-drawer', {
+            detail: {
+              proposalId: proposalInstanceId,
+              title: p.title || 'Đề nghị tạm ứng công tác',
+              amount: Number(p.amount) || 0,
+              category: 'advance_payment',
+              notes: p.notes || p.reason || 'Tạm ứng chi phí công tác',
+              approver_id: p.approver_id,
+              approver_id_2: p.approver_id_2
+            }
+          }));
+          toast.success('Đã mở Đề xuất tạm ứng và điền sẵn thông tin');
+          break;
+        }
+
+        case 'inventory_receipt': {
+          const poDraft = {
+            proposalId: proposalInstanceId,
+            notes: p.notes || p.reason || 'Phiếu nhập kho vật tư từ AI IDEAS',
+            supplier_name: p.supplier_name || 'Nhà cung cấp',
+            items: Array.isArray(p.items) ? p.items : [],
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_po_draft', JSON.stringify(poDraft));
+          if (!window.location.pathname.startsWith('/inventory')) {
+            navigate('/inventory?tab=purchase_orders&create_po=1');
+          } else {
+            navigate('/inventory?tab=purchase_orders&create_po=1');
+          }
+          toast.success('Đã mở Phiếu nhập kho (PO) và điền sẵn thông tin');
+          break;
+        }
+
+        case 'shift_swap': {
+          const todayLocal = new Date().toLocaleDateString('sv-SE');
+          const swapDetail = {
+            proposalId: proposalInstanceId,
+            createLeaveType: 'overtime',
+            start_date: p.date || p.start_date || todayLocal,
+            end_date: p.date || p.end_date || todayLocal,
+            reason: p.reason || p.notes || 'Đề xuất đổi ca trực/lịch làm việc (AI IDEAS)',
+            shift_type: p.shift_type || 'weekend',
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_leave_draft', JSON.stringify(swapDetail));
+          window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: swapDetail }));
+          if (!window.location.pathname.startsWith('/attendance')) {
+            navigate('/attendance?action=create-leave');
+          }
+          setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('open-create-leave-modal', { detail: swapDetail }));
+          }, 120);
+          toast.success('Đã mở Đề xuất đổi ca trực và điền sẵn thông tin');
+          break;
+        }
+
+        case 'admission_document_request': {
+          const cid = p.contact_id || p.id;
+          if (cid) {
+            useUIStore.getState().openCustomerDrawer(Number(cid), 'docs');
+          } else {
+            navigate('/contacts');
+          }
+          toast.success('Đã mở Hồ sơ học viên để kiểm tra và tải tài liệu thẩm định');
+          break;
+        }
+
+        case 'legal_contract': {
+          const cid = p.contact_id || p.id;
+          if (cid) {
+            useUIStore.getState().openCustomerDrawer(Number(cid), 'docs');
+          } else {
+            navigate('/deposits');
+          }
+          toast.success('Đã mở mục Quản lý Hợp đồng & Cam kết đào tạo');
+          break;
+        }
+
+        case 'asset_handover': {
+          navigate('/hrm?tab=profiles');
+          toast.success('Đã mở Hồ sơ Nhân sự & Tài sản (HRM) để lập biên bản bàn giao');
+          break;
+        }
+
+        case 'marketing_campaign': {
+          navigate('/projects?tab=campaigns');
+          toast.success('Đã mở phân hệ Chiến dịch / Khóa học');
+          break;
+        }
+
+        case 'ticket': {
+          const ticketDraft = {
+            proposalId: proposalInstanceId,
+            subject: p.subject || p.title || 'Hỗ trợ học viên từ AI IDEAS',
+            priority: p.priority || 'medium',
+            customer_name: p.customer_name || p.student_name || '',
+            contact_id: p.contact_id || null,
+            description: p.description || p.notes || p.body || '',
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_ticket_draft', JSON.stringify(ticketDraft));
+          navigate('/support-tickets?create=1');
+          toast.success('Đã mở Phiếu hỗ trợ / Khiếu nại (Ticket) và điền sẵn thông tin');
+          break;
+        }
+
+        case 'quote': {
+          const quoteDraft = {
+            proposalId: proposalInstanceId,
+            title: p.title || 'Báo giá chương trình đào tạo',
+            customer_name: p.customer_name || p.contact_name || '',
+            contact_id: p.contact_id || null,
+            total: p.total || p.amount || 0,
+            notes: p.notes || '',
+            _draft_created_at: Date.now()
+          };
+          sessionStorage.setItem('pending_quote_draft', JSON.stringify(quoteDraft));
+          navigate('/quotes?create=1');
+          toast.success('Đã mở Báo giá (Quote) và điền sẵn thông tin');
+          break;
+        }
+
+        case 'deal': {
+          const dealDraft = { ...p, proposalId: proposalInstanceId };
+          sessionStorage.setItem('ai_draft_deal', JSON.stringify(dealDraft));
+          window.dispatchEvent(new CustomEvent('open-create-deal-modal', { detail: dealDraft }));
+          if (!window.location.pathname.startsWith('/deals')) {
+            navigate('/deals?create=1');
+          }
+          setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('open-create-deal-modal', { detail: dealDraft }));
+          }, 120);
+          toast.success('Đã mở Cơ hội tuyển sinh / Deal và điền sẵn thông tin');
+          break;
+        }
+
+        case 'export_data':
+        case 'export': {
+          setStatus('submitting');
+          const rawType = String(p.export_type || p.type || 'contact').toLowerCase();
+          let expType = 'contact';
+          if (['company', 'companies', 'doanh_nghiep'].includes(rawType)) {
+            expType = 'company';
+          } else if (['deal', 'deals', 'co_hoi', 'b2b'].includes(rawType)) {
+            expType = 'deal';
+          } else if (['product', 'products', 'san_pham'].includes(rawType)) {
+            expType = 'product';
+          } else if (['inventory', 'inventories', 'kho', 'vat_tu'].includes(rawType)) {
+            expType = 'inventory';
+          } else if (['asset', 'assets', 'tai_san'].includes(rawType)) {
+            expType = 'asset';
+          } else if (['attendance', 'attendances', 'bang_cong', 'cham_cong'].includes(rawType)) {
+            expType = 'attendance';
+          } else if (['expense', 'expenses', 'chi_phi', 'phieu_chi'].includes(rawType)) {
+            expType = 'expense';
+          } else if (['purchase_order', 'purchase_orders', 'po', 'don_mua_hang'].includes(rawType)) {
+            expType = 'purchase_order';
+          } else if (['deposit', 'deposits', 'phieu_thu', 'dat_coc', 'doanh_thu'].includes(rawType)) {
+            expType = 'deposit';
+          } else if (['sales_order', 'sales_orders', 'so', 'don_dat_hang', 'don_hang_ban'].includes(rawType)) {
+            expType = 'sales_order';
+          } else if (['invoice', 'invoices', 'hoa_don'].includes(rawType)) {
+            expType = 'invoice';
+          } else if (['quote', 'quotes', 'bao_gia'].includes(rawType)) {
+            expType = 'quote';
+          } else if (['supplier', 'suppliers', 'nha_cung_cap', 'vendor', 'vendors'].includes(rawType)) {
+            expType = 'supplier';
+          } else if (['salary_advance', 'salary_advances', 'advance', 'tam_ung', 'tam_ung_luong'].includes(rawType)) {
+            expType = 'salary_advance';
+          } else if (['task', 'tasks', 'cong_viec', 'nhiem_vu'].includes(rawType)) {
+            expType = 'task';
+          } else if (['ticket', 'tickets', 'sla', 'yeu_cau', 'ho_tro'].includes(rawType)) {
+            expType = 'ticket';
+          } else if (['staff', 'employee', 'employees', 'hrm', 'nhan_su', 'payroll', 'bang_luong'].includes(rawType)) {
+            expType = 'staff';
+          }
+
+          toast.loading('Đang trích xuất và tải tệp Excel...', { id: 'export-action-toast' });
+          const fileName = p.filename || p.file_name || `export_${expType}_${new Date().toLocaleDateString('sv-SE')}.csv`;
+
+          let endpoint = '/export';
+          const paramsObj: Record<string, any> = { type: expType };
+          const downloadUrl = p.download_url || p.url || '';
+          const normalizeExportPath = (rawPath: string) => {
+            const stripped = rawPath.replace(/^\/?(?:backend|api)(?:\/(?:backend|api))*/i, '');
+            if (!stripped || stripped === '/') return '/export';
+            return stripped.startsWith('/') ? stripped : `/${stripped}`;
+          };
+
+          if (downloadUrl) {
+            try {
+              const urlObj = new URL(downloadUrl, window.location.origin);
+              endpoint = normalizeExportPath(urlObj.pathname);
+              urlObj.searchParams.forEach((val, key) => {
+                paramsObj[key] = val;
+              });
+            } catch {
+              const qParts = downloadUrl.split('?');
+              endpoint = normalizeExportPath(qParts[0]);
+              if (qParts[1]) {
+                const sp = new URLSearchParams(qParts[1]);
+                sp.forEach((val, key) => {
+                  paramsObj[key] = val;
+                });
+              }
+            }
+          } else {
+            const forwardKeys = [
+              'search', 'segment', 'lead_status', 'status', 'statuses', 'from', 'to',
+              'owner_id', 'owners', 'team_id', 'tag', 'data_type', 'student_sub_tab',
+              'multi_program', 'export_mode', 'limit', 'stages', 'gender', 'program',
+              'programs', 'source', 'sources', 'city', 'branches_or_cities',
+              'financial_filter', 'min_deposit', 'stale_days',
+              'interaction_status', 'date_field', 'departments', 'department_or_team', 'category',
+              'period', 'min_amount', 'max_amount', 'overdue_only',
+              'milestone_status', 'priorities', 'close_date_status', 'min_value', 'max_value',
+              'unit_code', 'vendor_name', 'approval_filter', 'subtask_filter',
+              'custom_rules'
+            ];
+            forwardKeys.forEach((k) => {
+              if (p[k] !== undefined && p[k] !== null && p[k] !== '') {
+                paramsObj[k] = typeof p[k] === 'object' ? JSON.stringify(p[k]) : String(p[k]);
+              }
+            });
+          }
+
+          // Ensure normalized type
+          paramsObj.type = expType;
+
+          let hadError = false;
+          await downloadExportFile({
+            endpoint,
+            params: paramsObj,
+            defaultFilename: fileName,
+            onSuccess: () => {
+              toast.success('Đã tải tệp Excel', { id: 'export-action-toast' });
+            },
+            onError: (err: any) => {
+              hadError = true;
+              const errTxt = err?.message || 'Không thể tải file xuất dữ liệu';
+              setErrorMsg(errTxt);
+              toast.error(errTxt, { id: 'export-action-toast' });
+            }
+          });
+          if (hadError) {
+            setStatus('error');
+            return;
+          }
+          break;
+        }
+
+        default:
+          throw new Error('Loại hành động không được hỗ trợ: ' + proposal.action_type);
+      }
+
+      if (proposal.action_type === 'export_data' || proposal.action_type === 'export') {
+        setStatus('success');
+        recordProposalOutcome(proposalInstanceId, 'success', null);
+      } else if (
+        proposal.action_type === 'expense' ||
+        proposal.action_type === 'advance_payment' ||
+        proposal.action_type === 'task' ||
+        proposal.action_type === 'sales_order' ||
+        proposal.action_type === 'deposit' ||
+        proposal.action_type === 'deal' ||
+        ((proposal.action_type === 'admission_document_request' || proposal.action_type === 'legal_contract') && (p.contact_id || p.id))
+      ) {
+        // Global Drawers (zIndex >= 2147483620) overlay directly on top of WorkChat (zIndex 2147483000).
+        // Never un-maximize (toggleMaximize) or close/minimize WorkChat so user context is preserved.
+        if (proposal.action_type === 'expense' || proposal.action_type === 'advance_payment') {
+          toast('Đã mở phiếu đề xuất chi đè lên cửa sổ Chat để bạn đối chiếu và lưu.', { icon: 'ℹ️' });
+        }
+      } else {
+        // Page-level modals (Leave, Ticket, Quote, etc. on background page): minimize Chat Modal so the opened Modal in ERP is immediately visible
+        useChatStore.getState().minimizeChat();
+        toast('Đã mở form và thu nhỏ cửa sổ Chat để bạn dễ thao tác.', { icon: 'ℹ️' });
+      }
+
+      if (onExecuted) {
+        onExecuted(proposal.action_type, proposal.params);
+      }
+    } catch (err: any) {
+      console.error('Open & Prefill Error:', err);
+      const msg = err.response?.data?.message || err.message || 'Lỗi khi mở phiếu đề xuất';
+      setErrorMsg(msg);
+      setStatus('error');
+      isTriggeredLocallyRef.current = false;
+      if (activeProposalByFamily.get(family) === proposalInstanceId) {
+        activeProposalByFamily.delete(family);
+      }
+      toast.error(msg, { id: 'export-action-toast' });
+    } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const handleCancel = () => {
+    const family = getActionFamily(proposal.action_type);
+    isTriggeredLocallyRef.current = false;
+    if (activeProposalByFamily.get(family) === proposalInstanceId) {
+      activeProposalByFamily.delete(family);
+    }
+    setStatus('cancelled');
+    recordProposalOutcome(proposalInstanceId, 'cancelled', null);
+    toast('Đã hủy đề xuất khởi tạo.', { icon: 'ℹ️' });
+  };
+
+  const currentUser = useAuthStore((s) => s.user);
+
+  const getCardTheme = () => {
+    switch (proposal.action_type) {
+      case 'export_data':
+      case 'export':
+        return {
+          bg: '#F8FAFC',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#0F172A',
+          label: 'XUẤT DỮ LIỆU',
+          icon: <FileSpreadsheet size={13} color="#334155" strokeWidth={1.75} />
+        };
+      case 'task':
+        return {
+          bg: 'rgba(15, 23, 42, 0.06)',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#0F172A',
+          label: 'CÔNG VIỆC',
+          icon: <CheckSquare size={13} color="#334155" strokeWidth={1.75} />
+        };
+      case 'sales_order':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: 'ĐƠN HÀNG (SO)',
+          icon: <FileText size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'deposit':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: 'ĐẶT CỌC',
+          icon: <DollarSign size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'lead':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: 'KHÁCH HÀNG CRM',
+          icon: <User size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'inventory_receipt':
+        return {
+          bg: 'rgba(15, 23, 42, 0.06)',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#0F172A',
+          label: 'KHO VẬT TƯ',
+          icon: <Package size={13} color="#334155" strokeWidth={1.75} />
+        };
+      case 'asset_handover':
+        return {
+          bg: 'rgba(15, 23, 42, 0.06)',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#0F172A',
+          label: 'TÀI SẢN',
+          icon: <Package size={13} color="#334155" strokeWidth={1.75} />
+        };
+      case 'marketing_campaign':
+      case 'automation_flow':
+      case 'voucher_issue':
+      case 'sync_match_only':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: proposal.action_type === 'automation_flow'
+            ? 'AUTOMATION FLOW'
+            : proposal.action_type === 'voucher_issue'
+            ? 'VOUCHER ƯU ĐÃI'
+            : proposal.action_type === 'sync_match_only'
+            ? 'ĐỒNG BỘ MATCH-ONLY'
+            : 'MARKETING',
+          icon: <Sparkles size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'ticket':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: 'TICKET CSKH',
+          icon: <AlertCircle size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'quote':
+        return {
+          bg: 'rgba(15, 23, 42, 0.06)',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#0F172A',
+          label: 'BÁO GIÁ',
+          icon: <FileText size={13} color="#334155" strokeWidth={1.75} />
+        };
+      case 'deal':
+        return {
+          bg: 'rgba(189, 29, 45, 0.08)',
+          text: '#BD1D2D',
+          border: 'rgba(189, 29, 45, 0.25)',
+          accent: '#BD1D2D',
+          label: 'DEAL CRM',
+          icon: <DollarSign size={13} color="#BD1D2D" strokeWidth={1.75} />
+        };
+      case 'leave':
+      case 'expense':
+      case 'advance_payment':
+      case 'supplementary':
+      case 'shift_swap':
+      case 'admission_document_request':
+      case 'legal_contract':
+      default:
+        return {
+          bg: '#F1F5F9',
+          text: '#334155',
+          border: '#E2E8F0',
+          accent: '#BD1D2D',
+          label: 'QUY TRÌNH',
+          icon: <ClipboardList size={13} color="#334155" strokeWidth={1.75} />
+        };
+    }
+  };
+
+  const getStatusBadge = () => {
+    if (status === 'submitting') {
+      return { label: 'Đang xử lý...', bg: '#F1F5F9', text: '#334155' };
+    }
+    if (status === 'success') {
+      if (proposal.action_type === 'export_data' || proposal.action_type === 'export') {
+        return { label: 'Đã tải xong', bg: '#ECFDF5', text: '#047857' };
+      }
+      return { label: resultId ? `Đã tạo #${resultId}` : 'Đã mở phiếu', bg: '#ECFDF5', text: '#047857' };
+    }
+    if (status === 'cancelled') {
+      return { label: 'Đã hủy', bg: '#F1F5F9', text: '#64748B' };
+    }
+    if (status === 'error') {
+      return { label: 'Lỗi', bg: '#FEF2F2', text: '#BD1D2D' };
+    }
+    // Idle
+    if (proposal.action_type === 'export_data' || proposal.action_type === 'export') {
+      return { label: 'Sẵn sàng tải', bg: '#F1F5F9', text: '#334155' };
+    }
+    return { label: 'Chờ duyệt', bg: 'rgba(189, 29, 45, 0.08)', text: '#BD1D2D' };
+  };
+
+  const theme = getCardTheme();
+  const statBadge = getStatusBadge();
+  const p = proposal.params || {};
+
+  const senderName = p.created_by_name || p.creator_name || currentUser?.full_name || 'Người dùng';
+  const senderAvatar = p.created_by_avatar || p.creator_avatar || currentUser?.avatar_url || '';
+  const createdAtStr = p.created_at || (proposal as any).created_at || '';
+
+  const leadAssigneeName = p.assignee_name || p.owner_name || p.target_owner_name || null;
+  const approverOrAssigneeName = p.approver_name || leadAssigneeName || p.user_name || (p.approver_id ? `Người duyệt #${p.approver_id}` : null);
+  const approverAvatar = p.approver_avatar || p.assignee_avatar || '';
+  const approverLabel = proposal.action_type === 'lead'
+    ? 'Giao cho Sale'
+    : p.approver_name
+      ? 'Người duyệt'
+      : (p.assignee_name || p.user_name ? 'Người thực hiện' : 'Người duyệt');
+
+  let summaryRowText = '';
+  if (proposal.action_type === 'expense' || proposal.action_type === 'advance_payment') {
+    summaryRowText = `[Hồ sơ chi phí]: Danh mục: ${p.category || 'Khác'}${p.amount ? ` • ${Number(p.amount).toLocaleString('vi-VN')} đ` : ''}`;
+  } else if (proposal.action_type === 'export_data' || proposal.action_type === 'export') {
+    summaryRowText = `[Bộ lọc dữ liệu]: ${p.filters_summary || proposal.summary || 'Toàn bộ dữ liệu phù hợp'}`;
+  } else if (proposal.action_type === 'task') {
+    summaryRowText = `[Công việc]: ${p.priority ? `Ưu tiên: ${p.priority}` : ''}${p.due_date ? ` • Hạn: ${new Date(p.due_date).toLocaleDateString('vi-VN')}` : ''}`;
+  } else if (proposal.action_type === 'leave') {
+    summaryRowText = `[Nghỉ phép]: ${p.leave_type || 'Phép'}${p.total_days ? ` • ${p.total_days} ngày` : ''}${p.reason ? ` • Lý do: ${p.reason}` : ''}`;
+  } else if (proposal.action_type === 'sales_order' || proposal.action_type === 'deposit') {
+    summaryRowText = `[Đơn hàng]: ${p.customer_name ? `KH: ${p.customer_name}` : ''}${p.total_amount ? ` • ${Number(p.total_amount).toLocaleString('vi-VN')} đ` : ''}`;
+  } else if (proposal.action_type === 'ticket') {
+    summaryRowText = `[Ticket CSKH]: ${p.customer_name ? `Học viên: ${p.customer_name} • ` : ''}Ưu tiên: ${p.priority || 'Trung bình'}`;
+  } else if (proposal.action_type === 'quote') {
+    summaryRowText = `[Báo giá]: ${p.customer_name ? `KH: ${p.customer_name} • ` : ''}${p.total ? `${Number(p.total).toLocaleString('vi-VN')} đ` : ''}`;
+  } else if (proposal.action_type === 'deal') {
+    summaryRowText = `[Deal]: ${p.title || 'Cơ hội chốt tuyển sinh'}${p.value ? ` • ${Number(p.value).toLocaleString('vi-VN')} đ` : ''}`;
+  } else if (proposal.action_type === 'lead') {
+    const leadParts: string[] = [];
+    const leadFullName = p.name || p.full_name || p.contact_name;
+    if (leadFullName) leadParts.push(`KH: ${leadFullName}`);
+    if (p.phone) leadParts.push(`SĐT: ${p.phone}`);
+    if (p.program || p.type) leadParts.push(`Chương trình: ${p.program || p.type}`);
+    if (p.is_personal || p.source === 'ca_nhan') leadParts.push('Phân loại: Data cá nhân');
+    else if (p.source) leadParts.push(`Nguồn: ${p.source}`);
+    summaryRowText = leadParts.length > 0 ? leadParts.join(' • ') : (proposal.summary ? `[Chi tiết]: ${proposal.summary}` : '');
+  } else if (proposal.summary) {
+    summaryRowText = `[Chi tiết]: ${proposal.summary}`;
+  }
+
+  const idTag = p.id || p.code || p.entity_id || (String(messageId).replace(/\D/g, '').slice(-4) || '1685');
+
+  const getButtonContent = () => {
+    if (status === 'submitting') {
+      return (
+        <>
+          <Loader2 size={13} className="animate-spin" />
+          <span>Đang xử lý...</span>
+        </>
+      );
+    }
+    if (status === 'success') {
+      return (
+        <>
+          <Check size={13} />
+          <span>Đã hoàn thành {resultId ? `#${resultId}` : ''}</span>
+        </>
+      );
+    }
+    if (status === 'cancelled') {
+      return (
+        <>
+          <X size={13} />
+          <span>Đã hủy đề xuất</span>
+        </>
+      );
+    }
+    if (proposal.action_type === 'export_data' || proposal.action_type === 'export') {
+      return (
+        <>
+          <Download size={13} />
+          <span>Tải tệp Excel ngay {p.estimated_count ? `(${p.estimated_count} dòng)` : ''}</span>
+        </>
+      );
+    }
+    if (proposal.action_type === 'task') {
+      return (
+        <>
+          <CheckSquare size={13} />
+          <span>Mở Task & Điền sẵn thông tin</span>
+        </>
+      );
+    }
+    if (proposal.action_type === 'lead') {
+      return (
+        <>
+          <User size={13} />
+          <span>Mở Form Thêm Lead & Điền sẵn</span>
+        </>
+      );
+    }
+    return (
+      <>
+        <ExternalLink size={13} />
+        <span>Xem chi tiết quy trình</span>
+      </>
+    );
+  };
+
+  return (
+    <div
+      onClick={handleOpenAndPrefill}
+      style={{
+        marginTop: '8px',
+        marginBottom: '8px',
+        background: '#FFFFFF',
+        border: '1px solid #E2E8F0',
+        borderRadius: '12px',
+        padding: '12px',
+        boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)',
+        minWidth: '240px',
+        maxWidth: '300px',
+        color: '#0F172A',
+        textAlign: 'left',
+        cursor: 'pointer',
+        transition: 'border-color 0.15s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.borderColor = '#CBD5E1';
+        e.currentTarget.style.boxShadow = '0 4px 12px rgba(15, 23, 42, 0.08)';
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.borderColor = '#E2E8F0';
+        e.currentTarget.style.boxShadow = '0 1px 3px rgba(15, 23, 42, 0.04)';
+      }}
+    >
+      {/* Top Header Tags */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px', gap: '8px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '4px',
+            fontSize: '0.65rem',
+            fontWeight: 600,
+            padding: '2px 8px',
+            borderRadius: '4px',
+            background: theme.bg,
+            color: theme.text,
+            border: `1px solid ${theme.border}`,
+            whiteSpace: 'nowrap'
+          }}>
+            {theme.icon}
+            <span>{theme.label}</span>
+          </div>
+          {statBadge && (
+            <span style={{
+              fontSize: '0.65rem',
+              fontWeight: 600,
+              padding: '2px 6px',
+              borderRadius: '4px',
+              background: statBadge.bg,
+              color: statBadge.text,
+              whiteSpace: 'nowrap'
+            }}>
+              {statBadge.label}
+            </span>
+          )}
+        </div>
+        <span style={{ fontSize: '0.65rem', color: '#94A3B8', fontWeight: 600, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
+          #{idTag}
+        </span>
+      </div>
+
+      {/* Card Title */}
+      <div style={{
+        fontWeight: 600,
+        fontSize: '0.82rem',
+        color: '#0F172A',
+        lineHeight: 1.35,
+        marginBottom: '8px'
+      }}>
+        {proposal.title || 'Đề xuất Khởi tạo Quy trình'}
+      </div>
+
+      {/* Metadata rows */}
+      <div style={{ fontSize: '0.75rem', color: '#64748B', display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '8px', fontVariantNumeric: 'tabular-nums' }}>
+        {/* Row 1: Sender */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <Avatar src={senderAvatar} name={senderName} size={18} />
+          <span>
+            Người gửi: <strong style={{ color: '#334155', fontWeight: 600 }}>{senderName}</strong> {createdAtStr ? <span style={{ color: '#94A3B8', fontSize: '0.7rem' }}>({createdAtStr})</span> : ''}
+          </span>
+        </div>
+
+        {/* Row 2: Approver / Assignee */}
+        {approverOrAssigneeName && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Avatar src={approverAvatar} name={approverOrAssigneeName} size={18} />
+            <span>
+              {approverLabel}: <strong style={{ color: '#334155', fontWeight: 600 }}>{approverOrAssigneeName}</strong>
+            </span>
+          </div>
+        )}
+
+        {/* Lead-specific Program / Personal badges */}
+        {proposal.action_type === 'lead' && (p.program || p.type) && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ color: '#64748B' }}>Chương trình: <strong style={{ color: '#334155', fontWeight: 600 }}>{p.program || p.type}</strong></span>
+          </div>
+        )}
+        {proposal.action_type === 'lead' && (p.is_personal || p.source === 'ca_nhan') && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ color: '#64748B' }}>Phân loại: <strong style={{ color: '#BD1D2D', fontWeight: 600 }}>Data cá nhân</strong></span>
+          </div>
+        )}
+
+        {/* Row 3: Summary / Filter details */}
+        {summaryRowText && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <Clock size={13} color="#64748B" strokeWidth={1.75} style={{ flexShrink: 0 }} />
+            <span style={{ wordBreak: 'break-word', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {summaryRowText}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Error message if any */}
+      {errorMsg && (
+        <div style={{
+          marginBottom: '8px',
+          padding: '4px 8px',
+          background: '#FEF2F2',
+          border: '1px solid #FECACA',
+          borderRadius: '6px',
+          color: '#991B1B',
+          fontSize: '0.72rem',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '4px'
+        }}>
+          <AlertCircle size={12} className="flex-shrink-0" strokeWidth={1.75} />
+          <span>{errorMsg}</span>
+        </div>
+      )}
+
+      {/* Action Button */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        {status === 'idle' && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              handleCancel();
+            }}
+            title="Hủy bỏ"
+            style={{
+              padding: '8px',
+              borderRadius: '8px',
+              border: '1px solid #E2E8F0',
+              background: '#F8FAFC',
+              color: '#64748B',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1), color 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = '#BD1D2D'; e.currentTarget.style.background = '#FEF2F2'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = '#64748B'; e.currentTarget.style.background = '#F8FAFC'; }}
+          >
+            <X size={12} strokeWidth={1.75} />
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={status === 'submitting' || status === 'success' || status === 'cancelled'}
+          onClick={(e) => {
+            e.stopPropagation();
+            handleOpenAndPrefill();
+          }}
+          style={{
+            flex: 1,
+            padding: '8px 12px',
+            borderRadius: '8px',
+            border: 'none',
+            background: status === 'success' ? '#0F172A' : (status === 'cancelled' ? '#94A3B8' : theme.accent),
+            color: '#FFFFFF',
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            cursor: (status === 'submitting' || status === 'success' || status === 'cancelled') ? 'default' : 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: '8px',
+            transition: 'opacity 0.15s cubic-bezier(0.22, 1, 0.36, 1)'
+          }}
+          onMouseEnter={(e) => { if (status === 'idle') e.currentTarget.style.opacity = '0.9'; }}
+          onMouseLeave={(e) => { if (status === 'idle') e.currentTarget.style.opacity = '1'; }}
+        >
+          {getButtonContent()}
+        </button>
+      </div>
+    </div>
+  );
+};

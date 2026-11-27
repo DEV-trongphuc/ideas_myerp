@@ -1,0 +1,736 @@
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronDown, Search, Check } from 'lucide-react';
+import styles from './CustomSelect.module.css';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Avatar } from './Avatar';
+import { useLanguage } from '../../contexts/LanguageContext';
+import toast from 'react-hot-toast';
+
+export interface SelectOption {
+  value: string | number;
+  label: string;
+  icon?: React.ReactNode;
+  avatar?: string;
+  avatarBorder?: string;
+  sublabel?: string;
+  searchKeywords?: string;
+  disabled?: boolean;
+  disabledReason?: string;
+  disabledType?: 'round' | 'sale';
+  faded?: boolean;
+  badge?: {
+    count: number;
+    color?: string;
+  };
+}
+
+export interface CustomSelectProps {
+  options: SelectOption[];
+  value: any;
+  onChange: (value: any) => void;
+  placeholder?: string;
+  label?: string;
+  searchable?: boolean;
+  showAvatars?: boolean;
+  avatarsOnly?: boolean;
+  width?: string | number;
+  direction?: 'up' | 'down';
+  multiple?: boolean;
+  align?: 'left' | 'right';
+  size?: 'xs' | 'sm' | 'md';
+  disabled?: boolean;
+  hideSelectedSublabel?: boolean;
+  onSearchChange?: (search: string) => void;
+  loading?: boolean;
+  allowCustomInput?: boolean;
+  customInputLabel?: string;
+  darkSurface?: boolean;
+  triggerStyle?: React.CSSProperties;
+}
+
+const removeVietnameseTones = (str: string): string => {
+  if (!str) return '';
+  return str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .trim();
+};
+
+// eslint-disable-next-line react-refresh/only-export-components
+export const getAvatarRingStyle = (border?: string): React.CSSProperties | undefined => {
+  if (!border) return undefined;
+  const b = border.toLowerCase();
+  let ringColor: string;
+  let borderColor = border;
+  const isPending = b.includes('f59e0b') || b.includes('d97706') || b.includes('amber') || b.includes('orange') || b === 'pending';
+
+  if (b.includes('10b981') || b.includes('green') || b.includes('emerald') || b === 'approved') {
+    borderColor = '#10b981';
+    ringColor = 'rgba(16, 185, 129, 0.28)';
+  } else if (b.includes('ef4444') || b.includes('red') || b === 'rejected') {
+    borderColor = '#ef4444';
+    ringColor = 'rgba(239, 68, 68, 0.28)';
+  } else if (b.includes('cbd5e1') || b.includes('gray') || b.includes('slate') || b === 'not_reached' || b === 'waiting') {
+    borderColor = '#cbd5e1';
+    ringColor = 'rgba(203, 213, 225, 0.4)';
+  } else if (isPending) {
+    borderColor = '#f59e0b';
+    ringColor = 'rgba(245, 158, 11, 0.28)';
+  } else {
+    ringColor = `${border}25`;
+  }
+  return {
+    borderRadius: '50%',
+    padding: '1.5px',
+    margin: '2px 4px 2px 2px',
+    border: `2px solid ${borderColor}`,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    boxShadow: `0 0 0 2px ${ringColor}`,
+    transition: 'border-color 0.2s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.2s cubic-bezier(0.22, 1, 0.36, 1)',
+  };
+};
+
+export const CustomSelect: React.FC<CustomSelectProps> = ({
+  options,
+  value,
+  onChange,
+  placeholder = 'Chọn...',
+  label,
+  searchable = false,
+  showAvatars = false,
+  avatarsOnly = false,
+  width,
+  direction = 'down',
+  multiple = false,
+  align = 'left',
+  size = 'sm',
+  disabled = false,
+  hideSelectedSublabel = false,
+  onSearchChange,
+  loading = false,
+  allowCustomInput = false,
+  customInputLabel,
+  darkSurface = false,
+  triggerStyle
+}) => {
+  const { t } = useLanguage();
+  const [isOpen, setIsOpen] = useState(false);
+  const [hasOpened, setHasOpened] = useState(false);
+  const [search, setSearch] = useState('');
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const [dropdownDirection, setDropdownDirection] = useState<'up' | 'down'>(direction);
+  const [dropdownAlign, setDropdownAlign] = useState<'left' | 'right'>(align);
+  const [portalGeom, setPortalGeom] = useState<{
+    top?: number;
+    bottom?: number;
+    left?: number;
+    right?: number;
+    minWidth: number;
+    maxWidth: number;
+    maxListHeight: number;
+    zIndex: number;
+  } | null>(null);
+  const onSearchChangeRef = useRef(onSearchChange);
+  const prevSearchRef = useRef(search);
+
+  useEffect(() => {
+    onSearchChangeRef.current = onSearchChange;
+  }, [onSearchChange]);
+
+  useEffect(() => {
+    if (isOpen) {
+      setHasOpened(true);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    setDropdownAlign(align);
+  }, [align]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(target) &&
+        (!dropdownRef.current || !dropdownRef.current.contains(target))
+      ) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        setIsOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (prevSearchRef.current === search) return;
+    prevSearchRef.current = search;
+    if (onSearchChangeRef.current) {
+      const handler = setTimeout(() => {
+        onSearchChangeRef.current?.(search);
+      }, 300);
+      return () => clearTimeout(handler);
+    }
+  }, [search]);
+
+  const updateDropdownPosition = useCallback(() => {
+    if (!containerRef.current || typeof window === 'undefined') return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const vvTop = vv ? vv.offsetTop : 0;
+    const vvLeft = vv ? vv.offsetLeft : 0;
+    const vvWidth = vv ? vv.width : window.innerWidth;
+    const vvHeight = vv ? vv.height : window.innerHeight;
+    const vvBottom = vvTop + vvHeight;
+    const layoutHeight = window.innerHeight || vvHeight;
+    const layoutWidth = window.innerWidth || vvWidth;
+    const isMobile = layoutWidth <= 768;
+
+    const spaceBelow = Math.max(0, vvBottom - rect.bottom - 8);
+    const spaceAbove = Math.max(0, rect.top - vvTop - 8);
+
+    let nextDir: 'up' | 'down' = direction;
+    if (isMobile && (multiple || spaceBelow < 230) && spaceAbove > spaceBelow) {
+      nextDir = 'up';
+    } else if (spaceBelow < 240 && spaceAbove > spaceBelow) {
+      nextDir = 'up';
+    } else if (direction === 'up' && spaceAbove < 200 && spaceBelow > spaceAbove) {
+      nextDir = 'down';
+    }
+    setDropdownDirection(nextDir);
+
+    const maxAllowedWidth = Math.min(450, Math.max(200, vvWidth - 16));
+    const minW = Math.min(maxAllowedWidth, Math.max(isMobile ? 190 : 0, Math.round(rect.width)));
+
+    let nextAlign: 'left' | 'right' = align;
+    if (align === 'right' || (isMobile && (rect.left + minW > vvLeft + vvWidth - 8 || rect.right > vvLeft + vvWidth - 40))) {
+      nextAlign = 'right';
+    } else if (rect.left + Math.max(minW, 240) > vvLeft + vvWidth - 8 && rect.right - minW >= vvLeft + 8) {
+      nextAlign = 'right';
+    } else {
+      nextAlign = 'left';
+    }
+    setDropdownAlign(nextAlign);
+
+    let maxAncestorZ = 1000;
+    let el: HTMLElement | null = containerRef.current;
+    while (el && el !== document.body) {
+      const zStr = window.getComputedStyle(el).zIndex;
+      const zNum = Number(zStr);
+      if (Number.isFinite(zNum) && zNum > maxAncestorZ) {
+        maxAncestorZ = zNum;
+      }
+      el = el.parentElement;
+    }
+    const zIndex = Math.min(2147483645, Math.max(1050, maxAncestorZ + 5));
+
+    const availSpace = nextDir === 'up' ? spaceAbove : spaceBelow;
+    const chromeReserve = searchable ? 62 : 16;
+    const maxListHeight = Math.max(110, Math.min(280, Math.floor(availSpace - chromeReserve)));
+
+    const topPos = nextDir === 'down'
+      ? Math.max(vvTop + 6, Math.min(vvBottom - 90, rect.bottom + 6))
+      : undefined;
+    const bottomPos = nextDir === 'up'
+      ? Math.max(layoutHeight - vvBottom + 6, layoutHeight - rect.top + 6)
+      : undefined;
+
+    const leftPos = nextAlign === 'left'
+      ? Math.max(vvLeft + 8, Math.min(vvLeft + vvWidth - minW - 8, rect.left))
+      : undefined;
+    const rightPos = nextAlign === 'right'
+      ? Math.max(8, layoutWidth - rect.right)
+      : undefined;
+
+    setPortalGeom({
+      top: topPos,
+      bottom: bottomPos,
+      left: leftPos,
+      right: rightPos,
+      minWidth: minW,
+      maxWidth: maxAllowedWidth,
+      maxListHeight,
+      zIndex,
+    });
+  }, [direction, multiple, align, searchable]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setPortalGeom(null);
+      return;
+    }
+    updateDropdownPosition();
+    const vv = window.visualViewport;
+    const handleReposition = () => updateDropdownPosition();
+    window.addEventListener('resize', handleReposition);
+    window.addEventListener('scroll', handleReposition, true);
+    vv?.addEventListener('resize', handleReposition);
+    vv?.addEventListener('scroll', handleReposition);
+    return () => {
+      window.removeEventListener('resize', handleReposition);
+      window.removeEventListener('scroll', handleReposition, true);
+      vv?.removeEventListener('resize', handleReposition);
+      vv?.removeEventListener('scroll', handleReposition);
+    };
+  }, [isOpen, updateDropdownPosition]);
+
+  const safeOptions = React.useMemo(() => (Array.isArray(options) ? options : []), [options]);
+
+  const selectedOption = React.useMemo(() => {
+    if (multiple) return null;
+    return safeOptions.find(opt => opt.value == value);
+  }, [safeOptions, value, multiple]);
+
+  const searchIndex = React.useMemo(() => {
+    if (!searchable || !hasOpened) return [];
+    return safeOptions.map((option) => {
+      const labelStr = option.label ? String(option.label) : '';
+      const sublabelStr = option.sublabel ? String(option.sublabel) : '';
+      const keywordsStr = option.searchKeywords ? String(option.searchKeywords) : '';
+      const translatedLabel = t(labelStr) || '';
+      const translatedSublabel = t(sublabelStr) || '';
+
+      const rawText = `${labelStr} ${translatedLabel} ${sublabelStr} ${translatedSublabel} ${keywordsStr}`.toLowerCase();
+      const combinedClean = [
+        removeVietnameseTones(labelStr),
+        removeVietnameseTones(translatedLabel),
+        removeVietnameseTones(sublabelStr),
+        removeVietnameseTones(translatedSublabel),
+        removeVietnameseTones(keywordsStr),
+      ].join(' ');
+
+      return { option, rawText, combinedClean };
+    });
+  }, [safeOptions, searchable, hasOpened, t]);
+
+  const filtered = React.useMemo(() => {
+    if (!searchable || !search.trim()) return safeOptions;
+    const searchClean = removeVietnameseTones(search);
+    const searchWords = searchClean.split(/\s+/).filter(Boolean);
+    const rawSearchLower = search.trim().toLowerCase();
+
+    return searchIndex
+      .filter((item) => {
+        if (item.rawText.includes(rawSearchLower)) return true;
+        if (item.combinedClean.includes(searchClean)) return true;
+        if (searchWords.length > 1) {
+          return searchWords.every((word) => item.combinedClean.includes(word));
+        }
+        return false;
+      })
+      .map((item) => item.option);
+  }, [safeOptions, searchIndex, search, searchable]);
+
+  const isSelected = (val: string | number) => {
+    if (multiple) {
+      return Array.isArray(value) && value.some(v => String(v) === String(val));
+    }
+    return value == val;
+  };
+
+  const handleSelect = (option: SelectOption, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (option.disabled) {
+      const reason = option.disabledReason ||
+        (option.disabledType === 'round' ? t('Vòng không hoạt động') :
+          option.disabledType === 'sale' ? t('Sale không hoạt động') :
+            t('Lựa chọn này không hoạt động'));
+      toast.error(reason);
+      return;
+    }
+    const val = option.value;
+    if (multiple) {
+      const arr = Array.isArray(value) ? [...value] : [];
+      if (val === 'all') {
+        onChange(['all']);
+      } else {
+        const hasVal = arr.some(v => String(v) === String(val));
+        const newArr = hasVal
+          ? arr.filter(v => String(v) !== String(val))
+          : [...arr.filter(v => String(v) !== 'all'), val];
+        if (newArr.length === 0) onChange(['all']);
+        else onChange(newArr);
+      }
+    } else {
+      onChange(val);
+      setIsOpen(false);
+      setSearch('');
+    }
+  };
+
+  const renderTriggerContent = () => {
+    if (multiple) {
+      const arr = Array.isArray(value) ? value : [];
+      if (arr.length === 0 || arr.some(v => String(v) === 'all')) {
+        const allOption = safeOptions.find(o => String(o.value) === 'all');
+        return (
+          <span className={styles.triggerContent}>
+            {allOption?.icon && <span style={{ display: 'flex' }}>{allOption.icon}</span>}
+            {allOption ? t(allOption.label) : t(placeholder)}
+          </span>
+        );
+      }
+      const selectedOpts = safeOptions.filter(o => arr.some(v => String(v) === String(o.value)));
+      if (selectedOpts.length > 0) {
+        if (avatarsOnly) {
+          const maxVisible = 5;
+          return (
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center' }}>
+                {selectedOpts.slice(0, maxVisible).map((opt, idx) => (
+                  <div
+                    key={String(opt.value)}
+                    title={t(opt.label)}
+                    style={{
+                      marginLeft: idx === 0 ? 0 : -8,
+                      border: '2px solid var(--color-surface)',
+                      borderRadius: '50%',
+                      overflow: 'hidden',
+                      boxShadow: '0 2px 6px rgba(0,0,0,0.1)',
+                      zIndex: 10 - idx,
+                      display: 'flex'
+                    }}
+                  >
+                    {opt.avatar ? (
+                      <Avatar src={opt.avatar} name={t(opt.label)} size={26} />
+                    ) : (
+                      <Avatar name={t(opt.label)} size={26} />
+                    )}
+                  </div>
+                ))}
+                {selectedOpts.length > maxVisible && (
+                  <div
+                    style={{
+                      marginLeft: -8,
+                      width: 26,
+                      height: 26,
+                      borderRadius: '50%',
+                      background: 'var(--color-primary-light, #fef2f2)',
+                      color: 'var(--color-primary, #BD1D2D)',
+                      fontSize: '0.7rem',
+                      fontWeight: 800,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      border: '2px solid var(--color-surface)',
+                      boxShadow: '0 2px 6px rgba(0,0,0,0.1)',
+                      zIndex: 5
+                    }}
+                  >
+                    +{selectedOpts.length - maxVisible}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '5px', alignItems: 'center', width: '100%', padding: '2px 0' }}>
+            {selectedOpts.map(opt => (
+              <span
+                key={String(opt.value)}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: showAvatars ? '2px 10px 2px 4px' : '3px 10px',
+                  borderRadius: '20px',
+                  background: 'var(--color-bg-light, #f8fafc)',
+                  border: '1px solid var(--color-border-light, #e2e8f0)',
+                  color: 'var(--color-text, #0f172a)',
+                  fontSize: '0.75rem',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                  lineHeight: 1.3,
+                  boxShadow: '0 1px 2px rgba(0,0,0,0.03)'
+                }}
+              >
+                {showAvatars ? (
+                  opt.avatar ? (
+                    <Avatar src={opt.avatar} name={t(opt.label)} size={20} />
+                  ) : opt.icon ? (
+                    <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>{opt.icon}</span>
+                  ) : (
+                    <Avatar name={t(opt.label)} size={20} />
+                  )
+                ) : (
+                  opt.icon && <span style={{ display: 'flex', fontSize: '12px' }}>{opt.icon}</span>
+                )}
+                <span style={{ color: 'var(--color-text, #0f172a)', fontWeight: 600 }}>{t(opt.label)}</span>
+                <span
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleSelect(opt, e);
+                  }}
+                  style={{
+                    cursor: 'pointer',
+                    color: 'var(--color-text-muted, #64748b)',
+                    marginLeft: '2px',
+                    fontSize: '0.9rem',
+                    fontWeight: 700,
+                    lineHeight: 1,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    width: '14px',
+                    height: '14px',
+                    borderRadius: '50%',
+                    transition: 'all 0.15s'
+                  }}
+                  onMouseEnter={e => {
+                    e.currentTarget.style.color = 'var(--color-danger)';
+                    e.currentTarget.style.background = 'rgba(239, 68, 68, 0.1)';
+                  }}
+                  onMouseLeave={e => {
+                    e.currentTarget.style.color = 'var(--color-text-muted, #64748b)';
+                    e.currentTarget.style.background = 'transparent';
+                  }}
+                >
+                  ×
+                </span>
+              </span>
+            ))}
+          </div>
+        );
+      }
+    }
+    return selectedOption ? (
+      <span className={styles.triggerContent} style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%', justifyContent: 'space-between', minWidth: 0, overflow: 'visible' }}>
+        <span style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, overflow: 'visible', flex: 1 }}>
+          {showAvatars && (
+            selectedOption.value === '' ? (
+              <div style={{ width: size === 'xs' ? 18 : 24, height: size === 'xs' ? 18 : 24, borderRadius: '50%', background: 'var(--color-border-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: size === 'xs' ? '0.625rem' : '0.75rem', fontWeight: 600, color: 'var(--color-text-muted)', flexShrink: 0 }}>?</div>
+            ) : selectedOption.icon ? (
+              <span style={{ display: 'flex', flexShrink: 0 }}>{selectedOption.icon}</span>
+            ) : selectedOption.avatarBorder ? (
+              <div style={getAvatarRingStyle(selectedOption.avatarBorder)}>
+                <Avatar src={selectedOption.avatar} name={t(selectedOption.label)} size={size === 'xs' ? 16 : "sm"} />
+              </div>
+            ) : (
+              <Avatar src={selectedOption.avatar} name={t(selectedOption.label)} size={size === 'xs' ? 18 : "sm"} />
+            )
+          )}
+          {!showAvatars && selectedOption.icon && <span style={{ display: 'flex' }}>{selectedOption.icon}</span>}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: size === 'xs' ? 4 : 6, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1, fontSize: size === 'xs' ? '0.75rem' : undefined }}>{t(selectedOption.label)}</span>
+            {!hideSelectedSublabel && selectedOption.sublabel && <span style={{ fontSize: size === 'xs' ? '0.65rem' : '0.75rem', color: 'var(--color-text-muted)', fontWeight: 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1 }}>({t(selectedOption.sublabel)})</span>}
+          </span>
+        </span>
+        {selectedOption.badge && selectedOption.badge.count > 0 && (
+          <span style={{
+            background: selectedOption.badge.color || 'var(--color-danger)',
+            color: 'white',
+            borderRadius: '10px',
+            padding: size === 'xs' ? '1px 4px' : '2px 6px',
+            fontSize: size === 'xs' ? '0.625rem' : '0.7rem',
+            fontWeight: 700,
+            minWidth: size === 'xs' ? '14px' : '18px',
+            textAlign: 'center',
+            lineHeight: 1,
+            marginLeft: 'auto'
+          }}>
+            {selectedOption.badge.count}
+          </span>
+        )}
+      </span>
+    ) : (value && typeof value === 'string' && value.trim() && value !== '__CUSTOM_FOREIGN__' ? (
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: size === 'xs' ? 4 : 6, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontWeight: 650 }}>
+        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 1, fontSize: size === 'xs' ? '0.75rem' : undefined }}>{value}</span>
+      </span>
+    ) : t(placeholder));
+  };
+
+  return (
+    <div className={`${styles.wrapper} ${darkSurface ? styles.darkSurface : ''}`} ref={containerRef} style={{ width, maxWidth: '100%' }}>
+      {label && <label className={styles.label}>{t(label)}</label>}
+      <div
+        className={`${styles.trigger} ${size === 'sm' ? styles.sm : ''} ${multiple ? styles.multiple : ''} ${isOpen ? styles.open : ''}`}
+        onClick={() => !disabled && setIsOpen(!isOpen)}
+        style={{
+          cursor: disabled ? 'default' : 'pointer',
+          opacity: 1,
+          backgroundColor: disabled ? 'transparent' : undefined,
+          border: disabled ? 'none' : undefined,
+          boxShadow: disabled ? 'none' : undefined,
+          padding: disabled ? '0' : undefined,
+          maxWidth: '100%',
+          overflow: 'visible',
+          boxSizing: 'border-box',
+          ...(size === 'xs' ? {
+            minHeight: disabled ? 'auto' : '34px',
+            height: disabled ? 'auto' : (multiple ? 'auto' : '34px'),
+            padding: disabled ? '0' : (multiple ? '2px 6px' : '3px 8px'),
+            fontSize: '0.75rem',
+            borderRadius: 'var(--radius-md)'
+          } : size === 'sm' ? {
+            ...(disabled ? { minHeight: 'auto', height: 'auto', padding: '0' } : {}),
+            ...(multiple && !disabled ? { height: 'auto', padding: '4px 10px' } : {}),
+            borderRadius: 'var(--radius-md)'
+          } : {}),
+          ...((size === 'xs' && isOpen) ? {
+            boxShadow: '0 0 0 2px rgba(163, 20, 34, 0.12)'
+          } : (size === 'sm' && isOpen) ? {
+            boxShadow: '0 0 0 3px rgba(163, 20, 34, 0.1)'
+          } : {}),
+          ...(triggerStyle || {})
+        }}
+      >
+        <span 
+          className={(multiple && Array.isArray(value) && value.length > 0) || selectedOption ? styles.selectedValue : styles.placeholder}
+          style={multiple ? { whiteSpace: 'normal', overflow: 'visible', display: 'block', width: '100%' } : { overflow: 'visible', minWidth: 0, display: 'flex', alignItems: 'center', flex: 1 }}
+        >
+          {renderTriggerContent()}
+        </span>
+        {!disabled && <ChevronDown size={size === 'xs' ? 12 : (size === 'sm' ? 14 : 16)} className={`${styles.icon} ${isOpen ? styles.iconOpen : ''}`} />}
+      </div>
+
+      {typeof document !== 'undefined' && createPortal(
+        <AnimatePresence>
+          {isOpen && portalGeom && (
+            <motion.div
+              ref={dropdownRef}
+              initial={{ opacity: 0, y: dropdownDirection === 'down' ? -8 : 8, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: dropdownDirection === 'down' ? -8 : 8, scale: 0.98 }}
+              transition={{ duration: 0.15, ease: [0.16, 1, 0.3, 1] as any }}
+              className={`${styles.dropdown} ${darkSurface ? styles.darkSurface : ''}`}
+              style={{
+                position: 'fixed',
+                top: portalGeom.top !== undefined ? `${portalGeom.top}px` : 'auto',
+                bottom: portalGeom.bottom !== undefined ? `${portalGeom.bottom}px` : 'auto',
+                left: portalGeom.left !== undefined ? `${portalGeom.left}px` : 'auto',
+                right: portalGeom.right !== undefined ? `${portalGeom.right}px` : 'auto',
+                minWidth: `${portalGeom.minWidth}px`,
+                maxWidth: `${portalGeom.maxWidth}px`,
+                zIndex: portalGeom.zIndex,
+                transformOrigin: dropdownDirection === 'down' ? 'top' : 'bottom',
+                willChange: 'transform, opacity',
+                contain: 'layout style'
+              }}
+            >
+              {searchable && (
+                <div className={styles.searchBox}>
+                  <Search size={14} className={styles.searchIcon} />
+                  <input
+                    type="text"
+                    autoFocus
+                    placeholder={t("Tìm kiếm...")}
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    onClick={e => e.stopPropagation()}
+                    className={styles.searchInput}
+                  />
+                </div>
+              )}
+              <div className={`${styles.list} custom-scrollbar`} style={{ maxHeight: `${portalGeom.maxListHeight}px` }}>
+              {filtered.length > 0 ? filtered.map((option) => (
+                <div
+                  key={option.value}
+                  className={`${styles.option} ${isSelected(option.value) ? styles.optionSelected : ''} ${option.disabled ? styles.optionDisabled : ''}`}
+                  style={{ opacity: option.faded ? 0.45 : 1 }}
+                  onClick={(e) => handleSelect(option, e)}
+                >
+                  <div className={styles.optionLabel}>
+                    {showAvatars ? (
+                      option.value === '' ? (
+                        <div style={{ width: 24, height: 24, borderRadius: '50%', background: 'var(--color-border-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.75rem', fontWeight: 600, color: 'var(--color-text-muted)', flexShrink: 0 }}>?</div>
+                      ) : option.icon ? (
+                        <span style={{ display: 'flex', flexShrink: 0 }}>{option.icon}</span>
+                      ) : option.avatarBorder ? (
+                        <div style={getAvatarRingStyle(option.avatarBorder)}>
+                          <Avatar src={option.avatar} name={t(option.label)} size="sm" />
+                        </div>
+                      ) : (
+                        <Avatar src={option.avatar} name={t(option.label)} size="sm" />
+                      )
+                    ) : (
+                      option.icon && <span style={{ display: 'flex', flexShrink: 0 }}>{option.icon}</span>
+                    )}
+                    <div className={styles.optionText} style={{ display: 'flex', flexDirection: 'row', alignItems: 'center', gap: 6, width: '100%', justifyContent: 'space-between', flex: 1 }}>
+                      <div style={{ display: 'flex', flexDirection: 'column' }}>
+                        <span className={styles.optionMainLabel}>{t(option.label)}</span>
+                        {option.sublabel && <span className={styles.optionSublabel}>{t(option.sublabel)}</span>}
+                      </div>
+                      {option.badge && option.badge.count > 0 && (
+                        <span style={{
+                          background: option.badge.color || 'var(--color-danger)',
+                          color: 'white',
+                          borderRadius: '10px',
+                          padding: '2px 6px',
+                          fontSize: '0.7rem',
+                          fontWeight: 700,
+                          minWidth: '18px',
+                          textAlign: 'center',
+                          lineHeight: 1,
+                          marginLeft: 'auto'
+                        }}>
+                          {option.badge.count}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {isSelected(option.value) && <Check size={14} className={styles.checkIcon} />}
+                </div>
+              )) : (
+                <div className={styles.empty}>{loading ? t("Đang tìm kiếm...") : t("Không tìm thấy")}</div>
+              )}
+              {allowCustomInput && search.trim() && !filtered.some(o => removeVietnameseTones(o.label) === removeVietnameseTones(search.trim()) || String(o.value).toLowerCase() === search.trim().toLowerCase()) && (
+                <div
+                  className={styles.option}
+                  style={{
+                    borderTop: filtered.length > 0 ? '1px dashed var(--color-border)' : 'none',
+                    background: 'rgba(189, 29, 45, 0.06)',
+                    color: 'var(--color-primary, #BD1D2D)',
+                    fontWeight: 700,
+                    padding: '9px 12px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px'
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onChange(search.trim());
+                    setIsOpen(false);
+                    setSearch('');
+                  }}
+                >
+                  <span style={{ fontSize: '0.95rem', lineHeight: 1 }}>➕</span>
+                  <span style={{ fontSize: '0.8rem' }}>
+                    {customInputLabel ? `${customInputLabel}: "${search.trim()}"` : `${t('Sử dụng')}: "${search.trim()}"`}
+                  </span>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>,
+      document.body
+      )}
+    </div>
+  );
+};
+

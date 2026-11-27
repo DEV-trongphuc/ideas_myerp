@@ -1,0 +1,2496 @@
+import React, { useState, useEffect, useCallback, useRef, Suspense } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useLanguage } from '../../contexts/LanguageContext';
+import { Sidebar } from './Sidebar';
+import { MobileNavMenu } from './MobileNavMenu';
+import { Header } from './Header';
+import { CustomModal } from '../ui/CustomModal';
+import { CustomSelect } from '../ui/CustomSelect';
+import { Avatar } from '../ui/Avatar';
+import { useAuth } from '../../contexts/AuthContext';
+import { fetchAPI } from '../../utils/api';
+import { useUIStore } from '../../store/uiStore';
+import { useShallow } from 'zustand/react/shallow';
+import { useChatStore } from '../../store/chatStore';
+import { AlertToast } from '../ui/AlertToast';
+import { StatRowSkeleton } from '../ui/Skeleton';
+import { WorkspaceStickyPomodoro } from '../WorkspaceStickyPomodoro';
+import { pushOverlay } from '../../utils/overlayStack';
+import { getStreamTicket, clearStreamTicketCache } from '../../utils/streamTicket';
+import { sanitizeHtml } from '../../utils/sanitizeHtml';
+import { isSystemAdmin } from '../../utils/roleUtils';
+import { useTenantConfig } from '../../contexts/TenantConfigContext';
+
+const QuickAddLeadModal = React.lazy(() => import('../QuickAddLeadModal').then(m => ({ default: m.QuickAddLeadModal })));
+const ProfileModal = React.lazy(() => import('../ProfileModal').then(m => ({ default: m.ProfileModal })));
+const SmartCheckInModal = React.lazy(() => import('../ui/SmartCheckInModal').then(m => ({ default: m.SmartCheckInModal })));
+const AIChatbot = React.lazy(() => import('../ui/AIChatbot').then(m => ({ default: m.AIChatbot })));
+const DepositCreateDrawer = React.lazy(() => import('../DepositCreateDrawer').then(m => ({ default: m.DepositCreateDrawer })));
+import { prewarmSmartCheckInGPS } from '../../utils/checkInGeo';
+import { 
+  Ticket as TicketIcon, 
+  Activity, 
+  UserCheck, 
+  User,
+  Clock, 
+  ShieldAlert, 
+  AlertTriangle, 
+  Scale,
+  Settings, 
+  LogIn, 
+  RefreshCw, 
+  ChevronDown, 
+  ChevronUp, 
+  ChevronRight, 
+  Copy, 
+  HelpCircle, 
+  CheckCircle2, 
+  XCircle,
+  Mail,
+  MessageSquare,
+  Search,
+  Check,
+  Home,
+  Users,
+  Database,
+  Calendar,
+  BarChart2,
+  Fingerprint,
+  Camera,
+  CheckSquare,
+  DollarSign,
+  Clipboard,
+  EyeOff
+} from 'lucide-react';
+import toast from 'react-hot-toast';
+
+const QuickAddMountTrigger: React.FC<{ onMounted: () => void }> = ({ onMounted }) => {
+  useEffect(() => {
+    onMounted();
+  }, [onMounted]);
+  return null;
+};
+
+export const Layout = ({ children }: { children: React.ReactNode }) => {
+  const { t, language } = useLanguage();
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    try {
+      const saved = localStorage.getItem('sidebar_collapsed');
+      return saved !== null ? Boolean(JSON.parse(saved)) : false;
+    } catch {
+      return false;
+    }
+  });
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    if (!isMobileSidebarOpen) return;
+    return pushOverlay('mobile-sidebar-drawer', () => setIsMobileSidebarOpen(false), 2147483625);
+  }, [isMobileSidebarOpen]);
+
+  useEffect(() => {
+    const handleCloseMobileSidebar = () => setIsMobileSidebarOpen(false);
+    window.addEventListener('close-mobile-sidebar', handleCloseMobileSidebar);
+    return () => window.removeEventListener('close-mobile-sidebar', handleCloseMobileSidebar);
+  }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia ? window.matchMedia('(max-width: 767px)') : null;
+    const handleMq = (e?: MediaQueryListEvent) => {
+      setIsMobile(e ? e.matches : window.innerWidth < 768);
+    };
+    handleMq();
+    if (mq?.addEventListener) {
+      mq.addEventListener('change', handleMq);
+    } else if (mq?.addListener) {
+      mq.addListener(handleMq);
+    }
+    
+    // Smoothly dismiss splash screen once main app layout is mounted
+    if (typeof (window as any).hideSplashScreen === 'function') {
+      (window as any).hideSplashScreen();
+    }
+
+    return () => {
+      if (mq?.removeEventListener) {
+        mq.removeEventListener('change', handleMq);
+      } else if (mq?.removeListener) {
+        mq.removeListener(handleMq);
+      }
+    };
+  }, []);
+  
+  const { showPOS, setShowPOS } = useUIStore(
+    useShallow((s) => ({
+      showPOS: s.showPOS,
+      setShowPOS: s.setShowPOS,
+    }))
+  );
+  const [quickAddMounted, setQuickAddMounted] = useState(false);
+  const [quickAddReady, setQuickAddReady] = useState(false);
+  const pendingQuickAddRef = useRef<{ hasPending: boolean; detail: any }>({ hasPending: false, detail: undefined });
+  const isReplayingQuickAddRef = useRef(false);
+
+  useEffect(() => {
+    if (quickAddReady) return;
+    const handleEarlyQuickAdd = (e: Event) => {
+      if (isReplayingQuickAddRef.current) return;
+      const custom = e as CustomEvent;
+      pendingQuickAddRef.current = { hasPending: true, detail: custom?.detail };
+      setQuickAddMounted(true);
+    };
+    window.addEventListener('open-quick-add-lead', handleEarlyQuickAdd);
+    return () => window.removeEventListener('open-quick-add-lead', handleEarlyQuickAdd);
+  }, [quickAddReady]);
+
+  const handleQuickAddChunkMounted = useCallback(() => {
+    setQuickAddReady(true);
+    if (pendingQuickAddRef.current.hasPending) {
+      const detail = pendingQuickAddRef.current.detail;
+      pendingQuickAddRef.current = { hasPending: false, detail: undefined };
+      isReplayingQuickAddRef.current = true;
+      try {
+        window.dispatchEvent(new CustomEvent('open-quick-add-lead', { detail }));
+      } finally {
+        isReplayingQuickAddRef.current = false;
+      }
+    }
+  }, []);
+  
+  const { user, token, updateUser } = useAuth();
+  const { config: tenantConfig } = useTenantConfig();
+  const brandShortName = tenantConfig?.organization?.short_name || 'MYERP';
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [pendingTicketsCount, setPendingTicketsCount] = useState<number>(0);
+  const [heldLeadsCount, setHeldLeadsCount] = useState<number>(0);
+  const [pendingCheckInsCount, setPendingCheckInsCount] = useState<number>(0);
+  const [pendingCoopsCount, setPendingCoopsCount] = useState<number>(0);
+  const [pendingExpensesCount, setPendingExpensesCount] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pending_approvals_count');
+      return saved ? Number(saved) : 0;
+    } catch {
+      return 0;
+    }
+  });
+  const [isUnifiedInboxOpen, setIsUnifiedInboxOpen] = useState<boolean>(false);
+  const hasAutoOpenedRef = useRef<boolean>(false);
+  
+  // Sales pending signatures state
+  const [salesPendingSignCount, setSalesPendingSignCount] = useState<number>(0);
+  const [supportTicketsCount, setSupportTicketsCount] = useState<number>(0);
+  const [isSalesSignModalOpen, setIsSalesSignModalOpen] = useState<boolean>(false);
+
+  // Global Check-In State
+  const [todayCheckIn, setTodayCheckIn] = useState<any>(null);
+  const [isCheckInLoading, setIsCheckInLoading] = useState<boolean>(true);
+  const [checkInModalOpen, setCheckInModalOpen] = useState(false);
+  const [consultantProfile, setConsultantProfile] = useState<any>(null);
+  const [dismissTelegramReminder, setDismissTelegramReminder] = useState(false);
+  const [isTelegramModalOpen, setIsTelegramModalOpen] = useState(false);
+
+  const [sysSettings, setSysSettings] = useState<any>(null);
+  const managerBehaviorMode = user?.manager_behavior_mode || 'combined';
+  const isSales = user?.role === 'sale' || (user?.role === 'manager' && managerBehaviorMode === 'combined');
+  const isAttendanceExempt = Number((user as any)?.attendance_exempt) === 1;
+  const shouldCheckIn = Boolean(user?.role && !isSystemAdmin(user) && !isAttendanceExempt);
+
+  const getBottomNavItems = () => {
+    const roleLower = user?.role?.toLowerCase() || '';
+    const isSalesRole = roleLower === 'sale' || roleLower === 'sales';
+    const isAccountantRole = roleLower === 'accountant';
+    const totalApprovalsBadge = (pendingCoopsCount || 0) + (pendingExpensesCount || 0) + (salesPendingSignCount || 0);
+
+    if (isSalesRole) {
+      return [
+        { label: t('Quy trình'), href: '/approvals', icon: Clipboard, badge: totalApprovalsBadge },
+        { label: t('Chấm công'), href: '/attendance', icon: Fingerprint },
+        { label: t('Khách hàng'), href: '/contacts', icon: Users, isCenter: true },
+        { label: t('Bàn làm việc'), href: '/workspace', icon: CheckSquare, badge: supportTicketsCount },
+        { label: t('Tôi'), href: '/account', icon: User }
+      ];
+    }
+
+    if (isAccountantRole) {
+      return [
+        { label: t('Dashboard'), href: '/', icon: Home },
+        { label: t('Lịch trình'), href: '/calendar', icon: Calendar },
+        { label: t('Khách hàng'), href: '/contacts', icon: Users, isCenter: true },
+        { label: t('Quy trình'), href: '/approvals', icon: Clipboard, badge: totalApprovalsBadge },
+        { label: t('Tôi'), href: '/account', icon: User }
+      ];
+    }
+
+    // Default for everyone else
+    return [
+      { label: t('Dashboard'), href: isSales ? '/sale-portal' : '/', icon: Home },
+      { label: t('Bàn làm việc'), href: '/workspace', icon: CheckSquare, badge: supportTicketsCount },
+      { label: t('Khách hàng'), href: '/contacts', icon: Users, isCenter: true },
+      { label: t('Quy trình'), href: '/approvals', icon: Clipboard, badge: totalApprovalsBadge },
+      { label: t('Tôi'), href: '/account', icon: User }
+    ];
+  };
+
+  const bottomNavItems = getBottomNavItems();
+
+  const loadCheckInStatus = async () => {
+    if (!user) return;
+    try {
+      const res = await fetchAPI('check-ins&today_only=1');
+      if (res.success) {
+        setTodayCheckIn(res.data);
+      }
+    } catch (err) {
+      console.error("Error loading check-in status:", err);
+    } finally {
+      setIsCheckInLoading(false);
+    }
+  };
+
+  const loadConsultantProfile = async () => {
+    if (!user) return;
+    try {
+      const res = await fetchAPI('consultant-profile');
+      if (res.success && res.data) {
+        setConsultantProfile(res.data);
+        if (res.data.job_title && res.data.job_title !== user.job_title) {
+          updateUser({ job_title: res.data.job_title });
+        }
+      }
+    } catch (err) {
+      console.error("Error loading consultant profile:", err);
+    }
+  };
+
+  useEffect(() => {
+    loadCheckInStatus();
+    loadConsultantProfile();
+    if (shouldCheckIn) {
+      prewarmSmartCheckInGPS();
+    }
+    const handleSync = () => loadCheckInStatus();
+    const handleTrigger = () => {
+      prewarmSmartCheckInGPS();
+      setCheckInModalOpen(true);
+    };
+    window.addEventListener('checkin-status-changed', handleSync);
+    window.addEventListener('trigger-checkin-modal', handleTrigger);
+    return () => {
+      window.removeEventListener('checkin-status-changed', handleSync);
+      window.removeEventListener('trigger-checkin-modal', handleTrigger);
+    };
+  }, [user, shouldCheckIn]);
+
+  // Global Real-time SSE connection for instant updates (notifications, sidebar counts, portal refresh)
+  useEffect(() => {
+    let eventSource: EventSource | null = null;
+    let reconnectTimeout: any = null;
+    let isDisposed = false;
+    let lastNewLeads: number | null = null;
+    let lastUnreadNotifs: number | null = null;
+    let lastMaxContactId: number | null = null;
+    let lastMaxLeadId: number | null = null;
+
+    if (token) {
+      const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      const sseBase = isLocal ? '/backend' : (import.meta.env.VITE_API_URL || '/backend');
+
+      const connectSSE = async (forceRefresh = false) => {
+        if (isDisposed) return;
+        const ticket = await getStreamTicket('sse', forceRefresh);
+        if (!ticket || isDisposed) {
+          if (!isDisposed) {
+            if (reconnectTimeout) clearTimeout(reconnectTimeout);
+            reconnectTimeout = setTimeout(() => {
+              if (!isDisposed && document.visibilityState === 'visible') {
+                void connectSSE(true);
+              }
+            }, 15000);
+          }
+          return;
+        }
+        const url = `${sseBase}/api.php?action=get_sse_updates&ticket=${encodeURIComponent(ticket)}`;
+        if (eventSource) {
+          eventSource.close();
+        }
+        eventSource = new EventSource(url);
+
+        eventSource.addEventListener('update', (e: any) => {
+          let detail: any = {};
+          try {
+            if (e.data) detail = JSON.parse(e.data);
+          } catch (err) {}
+
+          // Dispatch custom window events to trigger instant updates across components
+          window.dispatchEvent(new CustomEvent('realtime-update-received', { detail }));
+          
+          // Dispatch contact-updated if new leads count changed, or new contact/lead ID appeared
+          if (detail) {
+            const hasNewLeadCount = typeof detail.new_leads === 'number' && lastNewLeads !== null && lastNewLeads !== detail.new_leads;
+            const hasNewContact = typeof detail.latest_contact_id === 'number' && lastMaxContactId !== null && lastMaxContactId !== detail.latest_contact_id;
+            const hasNewLead = typeof detail.latest_lead_id === 'number' && lastMaxLeadId !== null && lastMaxLeadId !== detail.latest_lead_id;
+            const hasNewNotifs = typeof detail.unread_notifications === 'number' && lastUnreadNotifs !== null && detail.unread_notifications > lastUnreadNotifs;
+
+            if (hasNewLeadCount || hasNewContact || hasNewLead || detail.contact_changed || detail.lead_changed) {
+              window.dispatchEvent(new Event('contact-updated'));
+            }
+
+            if (hasNewNotifs) {
+              window.dispatchEvent(new CustomEvent('notification-trigger'));
+            }
+
+            if (typeof detail.new_leads === 'number') lastNewLeads = detail.new_leads;
+            if (typeof detail.unread_notifications === 'number') lastUnreadNotifs = detail.unread_notifications;
+            if (typeof detail.latest_contact_id === 'number') lastMaxContactId = detail.latest_contact_id;
+            if (typeof detail.latest_lead_id === 'number') lastMaxLeadId = detail.latest_lead_id;
+          }
+        });
+
+        eventSource.addEventListener('close', () => {
+          if (eventSource) {
+            eventSource.close();
+          }
+          if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+          }
+          reconnectTimeout = setTimeout(() => {
+            if (!isDisposed && document.visibilityState === 'visible') {
+              void connectSSE(false);
+            }
+          }, 15000);
+        });
+
+        eventSource.onerror = () => {
+          if (eventSource) {
+            eventSource.close();
+          }
+          if (reconnectTimeout) {
+            clearTimeout(reconnectTimeout);
+          }
+          reconnectTimeout = setTimeout(() => {
+            if (!isDisposed && document.visibilityState === 'visible') {
+              void connectSSE(true);
+            }
+          }, 15000);
+        };
+      };
+
+      void connectSSE(false);
+
+      const handleVisibilityReconnect = () => {
+        if (document.visibilityState === 'visible') {
+          if (!eventSource || eventSource.readyState === EventSource.CLOSED) {
+            void connectSSE(false);
+          }
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityReconnect);
+
+      return () => {
+        isDisposed = true;
+        document.removeEventListener('visibilitychange', handleVisibilityReconnect);
+        if (eventSource) {
+          eventSource.close();
+        }
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        clearStreamTicketCache();
+      };
+    }
+  }, [token]);
+
+  // Hover states for notification buttons
+  const [isTicketViewHovered, setIsTicketViewHovered] = useState(false);
+  const [isTicketLaterHovered, setIsTicketLaterHovered] = useState(false);
+  const [isHeldViewHovered, setIsHeldViewHovered] = useState(false);
+  const [isHeldLaterHovered, setIsHeldLaterHovered] = useState(false);
+
+  // Helper translation mapping for held leads notification
+  const getTranslation = (key: string, fallback: string) => {
+    const val = t(key);
+    if (val === key && language !== 'vi') {
+      const localDict: Record<string, Record<string, string>> = {
+        en: {
+          "Thông báo Data tạm giữ": "Held Data Notification",
+          "dữ liệu bị tạm giữ bởi AI Pre-screener đang chờ bạn phê duyệt.": "below-standard leads held by AI Pre-screener waiting for your approval."
+        },
+        ja: {
+          "Thông báo Data tạm giữ": "一時保留データのお知らせ",
+          "dữ liệu bị tạm giữ bởi AI Pre-screener đang chờ bạn phê duyệt.": "件のデータがAI Pre-screenerによって一時保留され、承認待ちです。"
+        },
+        zh: {
+          "Thông báo Data tạm giữ": "暂存数据通知",
+          "dữ liệu bị tạm giữ bởi AI Pre-screener đang chờ bạn phê duyệt.": "条数据被 AI Pre-screener 暂扣，等待您的审批。"
+        }
+      };
+      return localDict[language]?.[key] || fallback;
+    }
+    return val;
+  };
+
+  // Activity Feed states
+  const [isActivityFeedOpen, setIsActivityFeedOpen] = useState(false);
+  const [feedItems, setFeedItems] = useState<any[]>([]);
+
+  const [expandedFeedItem, setExpandedFeedItem] = useState<string | null>(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const pageSize = 10;
+
+  // New subtabs for Activity Modal
+  const [activeTab, setActiveTab] = useState<'activity' | 'logs'>('activity');
+
+  // Logs state
+  const [notifLogs, setNotifLogs] = useState<any[]>([]);
+  const [notifTotalCount, setNotifTotalCount] = useState<number>(0);
+  const [notifPage, setNotifPage] = useState<number>(1);
+  const [notifFilterType, setNotifFilterType] = useState<string>('all');
+  const [notifFilterChannel, setNotifFilterChannel] = useState<string>('all');
+  const [notifSearchInput, setNotifSearchInput] = useState<string>('');
+  const [notifSearch, setNotifSearch] = useState<string>('');
+  const [notifFilterSale, setNotifFilterSale] = useState<string>('all');
+  const [isNotifLogsLoading, setIsNotifLogsLoading] = useState<boolean>(false);
+  const [copySuccessId, setCopySuccessId] = useState<string | null>(null);
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [consultants, setConsultants] = useState<any[]>([]);
+  const [accounts, setAccounts] = useState<any[]>([]);
+  const [hasFetchedUsers, setHasFetchedUsers] = useState<boolean>(false);
+  const [backendVersion, setBackendVersion] = useState<string>(() => {
+    return localStorage.getItem('backend_version') || '1.5.3';
+  });
+
+
+  const fetchUsersForLogs = async () => {
+    if (hasFetchedUsers) return;
+    try {
+      const [consRes, accRes] = await Promise.all([
+        fetchAPI('get_consultants'),
+        fetchAPI('get_accounts')
+      ]);
+      if (consRes.success) setConsultants(consRes.data || []);
+      if (accRes.success) setAccounts(accRes.data || []);
+      setHasFetchedUsers(true);
+    } catch (err) {
+      console.error("Error fetching users for logs mapping:", err);
+    }
+  };
+
+  const getAvatarAndNameByTarget = (target: string) => {
+    if (!target || target === '-') return { avatar: undefined, name: t('Hệ thống') };
+    const cleanTarget = target.trim().toLowerCase();
+    
+    // Check if target matches Zalo or Telegram Admin Group Chat IDs
+    const zaloGroup = sysSettings?.zalo_admin_group_chat_id ? String(sysSettings.zalo_admin_group_chat_id).trim().toLowerCase() : '';
+    const teleGroup = sysSettings?.telegram_admin_group_chat_id ? String(sysSettings.telegram_admin_group_chat_id).trim().toLowerCase() : '';
+
+    if (zaloGroup && cleanTarget === zaloGroup) {
+      return { 
+        avatar: 'https://stc-zpl.zdn.vn/favicon.ico', 
+        name: t('Zalo Group Bot (Admin)') 
+      };
+    }
+    if (teleGroup && cleanTarget === teleGroup) {
+      return { 
+        avatar: 'https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/3840px-Telegram_logo.svg.png', 
+        name: t('Telegram Group Bot (Admin)') 
+      };
+    }
+
+    const cons = consultants.find(c => {
+      const emailMatch = c.email && c.email.trim().toLowerCase() === cleanTarget;
+      const zaloMatch = c.zalo_chat_id && c.zalo_chat_id.toString().trim().toLowerCase() === cleanTarget;
+      const teleMatch = c.telegram_chat_id && c.telegram_chat_id.toString().trim().toLowerCase() === cleanTarget;
+      return emailMatch || zaloMatch || teleMatch;
+    });
+    if (cons) return { avatar: cons.avatar, name: cons.name };
+    
+    const acc = accounts.find(a => {
+      const emailMatch = a.email && a.email.trim().toLowerCase() === cleanTarget;
+      const zaloMatch = a.zalo_chat_id && a.zalo_chat_id.toString().trim().toLowerCase() === cleanTarget;
+      const teleMatch = a.telegram_chat_id && a.telegram_chat_id.toString().trim().toLowerCase() === cleanTarget;
+      return emailMatch || zaloMatch || teleMatch;
+    });
+    if (acc) return { avatar: acc.avatar, name: acc.name || acc.username };
+    
+    return { avatar: undefined, name: target };
+  };
+
+  const fetchNotifLogs = async () => {
+    setIsNotifLogsLoading(true);
+    try {
+      const res = await fetchAPI(`get_notification_logs&channel=${notifFilterChannel}&type=${notifFilterType}&sale=${notifFilterSale}&search=${encodeURIComponent(notifSearch)}&page=${notifPage}&pageSize=10`);
+      if (res.success && Array.isArray(res.data)) {
+        setNotifLogs(res.data);
+        setNotifTotalCount(res.total_count ?? 0);
+      }
+    } catch (err) {
+      console.error('Error fetching notification logs:', err);
+    } finally {
+      setIsNotifLogsLoading(false);
+    }
+  };
+
+  // Reset tab when modal closes
+  useEffect(() => {
+    if (!isActivityFeedOpen) {
+      setActiveTab('activity');
+      setNotifSearchInput('');
+      setNotifSearch('');
+      setNotifPage(1);
+      setNotifFilterChannel('all');
+      setNotifFilterType('all');
+      setNotifFilterSale('all');
+      setExpandedLogId(null);
+    }
+  }, [isActivityFeedOpen]);
+
+  // Debounce search input
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      const timer = setTimeout(() => {
+        setNotifSearch(notifSearchInput);
+        setNotifPage(1);
+      }, 400);
+      return () => clearTimeout(timer);
+    }
+  }, [notifSearchInput, activeTab]);
+
+  // Reset page on filter changes
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      setNotifPage(1);
+    }
+  }, [notifFilterChannel, notifFilterType, notifFilterSale]);
+
+  // Fetch notification logs
+  useEffect(() => {
+    if (isActivityFeedOpen && activeTab === 'logs') {
+      fetchUsersForLogs();
+      fetchNotifLogs();
+    }
+  }, [isActivityFeedOpen, activeTab, notifFilterChannel, notifFilterType, notifFilterSale, notifSearch, notifPage]);
+
+  const fetchFeed = async () => {
+    try {
+      const res = await fetchAPI('get_system_activity_feed');
+      if (res.success && Array.isArray(res.data)) {
+        setFeedItems(res.data);
+        setCurrentPage(1);
+      }
+    } catch (err) {
+      console.error('Error loading activity feed:', err);
+    }
+  };
+
+  useEffect(() => {
+    if (isActivityFeedOpen) {
+      fetchFeed();
+      setCurrentPage(1);
+    }
+  }, [isActivityFeedOpen]);
+
+  useEffect(() => {
+    const handleOpenFeed = () => {
+      setIsActivityFeedOpen(true);
+    };
+    window.addEventListener('open-activity-feed', handleOpenFeed);
+    return () => {
+      window.removeEventListener('open-activity-feed', handleOpenFeed);
+    };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      '--sidebar-width',
+      isSidebarCollapsed ? '60px' : '220px'
+    );
+  }, [isSidebarCollapsed]);
+
+  useEffect(() => {
+    const handleFocusMode = (e: Event) => {
+      const customEvent = e as CustomEvent;
+      if (customEvent.detail) {
+        if (customEvent.detail.isFocusMode) {
+          setIsSidebarCollapsed(true);
+        } else {
+          try {
+            const saved = localStorage.getItem('sidebar_collapsed');
+            setIsSidebarCollapsed(saved ? Boolean(JSON.parse(saved)) : false);
+          } catch {
+            setIsSidebarCollapsed(false);
+          }
+        }
+      }
+    };
+    window.addEventListener('focus-mode-toggle', handleFocusMode);
+    return () => {
+      window.removeEventListener('focus-mode-toggle', handleFocusMode);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (user?.id) {
+      fetchAPI('get_settings')
+        .then(res => {
+          if (res && res.success && res.data) {
+            setSysSettings(res.data);
+            if (res.data.backend_version) {
+              setBackendVersion(res.data.backend_version);
+              localStorage.setItem('backend_version', res.data.backend_version);
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }, [user?.id]);
+
+
+
+
+  const isFetchingCountsRef = useRef(false);
+
+  const fetchPendingCounts = useCallback(() => {
+    if (!user || isFetchingCountsRef.current) return;
+    
+    isFetchingCountsRef.current = true;
+    
+    fetchAPI('get_all_pending_counts')
+      .then(res => {
+        if (res.success && res.data) {
+          const {
+            ticketsCount,
+            heldCount,
+            checkinsCount,
+            coopsCount,
+            supportCount,
+            expensesCount,
+            salesPendingSignCount
+          } = res.data;
+
+          setPendingTicketsCount(ticketsCount);
+          setHeldLeadsCount(heldCount);
+          setPendingCheckInsCount(checkinsCount);
+          setPendingCoopsCount(coopsCount);
+          setSupportTicketsCount(supportCount);
+          const localApprovals = Number(localStorage.getItem('pending_approvals_count') || 0);
+          setPendingExpensesCount(Math.max(Number(expensesCount) || 0, localApprovals));
+          setSalesPendingSignCount(salesPendingSignCount);
+
+          // Tạm thời tắt tự động mở popup hộp thư tồn đọng mặc định theo yêu cầu
+          // Người dùng vẫn có thể bấm nút trên Header để mở bất kỳ lúc nào
+          /*
+          const currentPath = window.location.pathname;
+          if (currentPath !== '/support-tickets' && currentPath !== '/expenses') {
+            if (ticketsCount > 0 || heldCount > 0 || checkinsCount > 0 || coopsCount > 0 || supportCount > 0 || expensesCount > 0 || salesPendingSignCount > 0 || localApprovals > 0) {
+              const isPermanentlyDisabled = localStorage.getItem('unified_inbox_auto_open_disabled') === 'true';
+              const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
+              const dismissedToday = localStorage.getItem('unified_inbox_dismissed_date') === todayStr;
+
+              if (!isPermanentlyDisabled && !dismissedToday && !hasAutoOpenedRef.current) {
+                hasAutoOpenedRef.current = true;
+                const openInbox = () => {
+                  setTimeout(() => {
+                    setIsUnifiedInboxOpen(true);
+                  }, 600);
+                };
+                const splash = document.getElementById('ideas-splash-screen');
+                if (!splash || splash.classList.contains('splash-fade-out')) {
+                  openInbox();
+                } else {
+                  window.addEventListener('splash-dismissed', openInbox, { once: true });
+                }
+              }
+            }
+          }
+          */
+        }
+      })
+      .catch(err => {
+        console.error('Error loading unified approvals:', err);
+      })
+      .finally(() => {
+        isFetchingCountsRef.current = false;
+      });
+  }, [user]);
+
+  useEffect(() => {
+    fetchPendingCounts();
+  }, [fetchPendingCounts]);
+
+  useEffect(() => {
+    const handleApprovalBadge = (e: Event) => {
+      const custom = e as CustomEvent;
+      if (custom.detail && typeof custom.detail.count === 'number') {
+        setPendingExpensesCount(custom.detail.count);
+      }
+    };
+    window.addEventListener('approval-badge-updated', handleApprovalBadge);
+    window.addEventListener('refresh-pending-counts', fetchPendingCounts);
+    window.addEventListener('realtime-update-received', fetchPendingCounts);
+    window.addEventListener('ticket-resolved', fetchPendingCounts);
+    window.addEventListener('ticket-updated', fetchPendingCounts);
+    window.addEventListener('lead-report-resolved', fetchPendingCounts);
+    return () => {
+      window.removeEventListener('approval-badge-updated', handleApprovalBadge);
+      window.removeEventListener('refresh-pending-counts', fetchPendingCounts);
+      window.removeEventListener('realtime-update-received', fetchPendingCounts);
+      window.removeEventListener('ticket-resolved', fetchPendingCounts);
+      window.removeEventListener('ticket-updated', fetchPendingCounts);
+      window.removeEventListener('lead-report-resolved', fetchPendingCounts);
+    };
+  }, [fetchPendingCounts]);
+
+  const getActivityIcon = (item: any) => {
+    const size = 18;
+    switch (item.type) {
+      case 'distribution':
+        if (item.status === 'assigned' || item.status === 'compensation') {
+          return { icon: <UserCheck size={size} />, color: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' };
+        } else if (item.status === 'pending_work_hours') {
+          return { icon: <Clock size={size} />, color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.1)' };
+        } else if (item.status === 'duplicate') {
+          return { icon: <Copy size={size} />, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.1)' };
+        } else if (item.status === 'blacklisted') {
+          return { icon: <ShieldAlert size={size} />, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.1)' };
+        }
+        return { icon: <UserCheck size={size} />, color: '#BD1D2D', bg: 'rgba(189, 29, 45, 0.1)' };
+      case 'admin':
+        if (item.action === 'LOGIN') {
+          return { icon: <LogIn size={size} />, color: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' };
+        } else if (item.action?.includes('BLACKLIST')) {
+          return { icon: <ShieldAlert size={size} />, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.1)' };
+        }
+        return { icon: <Settings size={size} />, color: '#3b82f6', bg: 'rgba(59, 130, 246, 0.1)' };
+      case 'ticket':
+        if (item.status === 'resolved') {
+          return { icon: <CheckCircle2 size={size} />, color: '#10b981', bg: 'rgba(16, 185, 129, 0.1)' };
+        } else if (item.status === 'rejected') {
+          return { icon: <XCircle size={size} />, color: '#ef4444', bg: 'rgba(239, 68, 68, 0.1)' };
+        }
+        return { icon: <AlertTriangle size={size} />, color: '#f59e0b', bg: 'rgba(245, 158, 11, 0.1)' };
+      default:
+        return { icon: <HelpCircle size={size} />, color: '#6b7280', bg: 'rgba(107, 114, 128, 0.1)' };
+    }
+  };
+
+  const isAccountant = String(user?.role || '').toLowerCase() === 'accountant' || String(user?.role || '').toLowerCase() === 'ke_toan';
+  const effTicketsCount = isAccountant ? 0 : pendingTicketsCount;
+  const effHeldCount = isAccountant ? 0 : heldLeadsCount;
+  const effCheckInsCount = isAccountant ? 0 : pendingCheckInsCount;
+  const effCoopsCount = isAccountant ? 0 : pendingCoopsCount;
+  const effSupportCount = isAccountant ? 0 : supportTicketsCount;
+  const effExpensesCount = pendingExpensesCount;
+  const totalPendingInboxCount = effTicketsCount + effHeldCount + effCheckInsCount + effCoopsCount + effSupportCount + effExpensesCount;
+
+  return (
+    <div style={{ display: 'flex', height: '100dvh', minHeight: '100vh', width: '100vw', background: 'var(--color-bg)', overflow: 'hidden' }}>
+      <style>{`
+        @media (max-width: 600px) {
+          .logs-tab-container {
+            gap: 0.75rem !important;
+          }
+          .logs-tab-btn {
+            font-size: 0.75rem !important;
+            padding: 4px 2px !important;
+          }
+          .logs-toolbar {
+            padding: 0.4rem !important;
+            gap: 0.4rem !important;
+            margin-bottom: 0.75rem !important;
+          }
+          .logs-toolbar-item {
+            flex: 1 1 calc(33.33% - 0.27rem) !important;
+            min-width: 85px !important;
+          }
+          .logs-search-wrapper {
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+          }
+          .logs-search-wrapper input {
+            height: 32px !important;
+            padding-left: 26px !important;
+            padding-right: 8px !important;
+            font-size: 0.78rem !important;
+            border-radius: 6px !important;
+          }
+          .logs-search-wrapper svg {
+            left: 8px !important;
+            top: 9px !important;
+          }
+          .logs-sale-wrapper {
+            flex: 1.2 1 calc(33.33% - 0.27rem) !important;
+            min-width: 105px !important;
+          }
+          .logs-toolbar [class*="trigger"] {
+            min-height: 32px !important;
+            height: 32px !important;
+            padding: 0 0.4rem !important;
+            border-radius: 6px !important;
+            font-size: 0.75rem !important;
+          }
+          .logs-toolbar [class*="triggerContent"] {
+            gap: 0.35rem !important;
+          }
+          .logs-toolbar [class*="option"] {
+            padding: 0.4rem 0.5rem !important;
+            font-size: 0.78rem !important;
+          }
+          .pagination-container {
+            flex-direction: column !important;
+            gap: 8px !important;
+            align-items: center !important;
+          }
+          .pagination-text {
+            text-align: center !important;
+            white-space: nowrap !important;
+          }
+        }
+      `}</style>
+      {/* Mobile Modal Menu */}
+      {isMobile && isMobileSidebarOpen && (
+      <MobileNavMenu
+        isOpen={isMobile && isMobileSidebarOpen}
+        onClose={() => setIsMobileSidebarOpen(false)}
+        user={user}
+        tenantConfig={tenantConfig}
+        brandShortName={brandShortName}
+        pathname={location.pathname}
+        search={location.search}
+        onNavigate={(href) => navigate(href)}
+        onOpenChat={() => useChatStore.getState().openChat()}
+        fallbackBadges={{
+          tickets: effTicketsCount,
+          supportTickets: effSupportCount,
+          gatekeeper: effHeldCount,
+          coopSlips: effCoopsCount,
+          pendingExpenses: effExpensesCount,
+          pendingApprovals: effExpensesCount,
+        }}
+      />
+      )}
+
+      {!isMobile && (
+        <Sidebar 
+          isCollapsed={isSidebarCollapsed} 
+          onToggleCollapse={() => {
+            setIsSidebarCollapsed(prev => {
+              const newVal = !prev;
+              localStorage.setItem('sidebar_collapsed', JSON.stringify(newVal));
+              return newVal;
+            });
+          }} 
+          isMobileOpen={isMobileSidebarOpen}
+          onMobileClose={() => setIsMobileSidebarOpen(false)}
+        />
+      )}
+      {(() => {
+        const isWorkspaceRoute = location.pathname === '/workspace' || location.pathname === '/portal';
+        return (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, position: 'relative' }}>
+            <Header 
+              onActivityFeedClick={() => setIsActivityFeedOpen(true)}
+              onMenuClick={() => setIsMobileSidebarOpen(true)}
+              version={backendVersion}
+              pendingInboxCount={totalPendingInboxCount}
+              onUnifiedInboxClick={() => setIsUnifiedInboxOpen(true)}
+              requireCheckout={sysSettings?.require_checkout === '1' || sysSettings?.require_checkout === 1}
+              todayCheckIn={todayCheckIn}
+              isCheckInLoading={isCheckInLoading}
+              consultantProfile={consultantProfile}
+              sysSettings={sysSettings}
+              isWorkspace={isWorkspaceRoute}
+            />
+
+            {/* Main Content Viewport */}
+            <main 
+              className={`responsive-main ${isWorkspaceRoute ? 'workspace-full-bleed' : ''}`} 
+              style={{ 
+                flex: 1, 
+                overflowY: 'auto', 
+                overflowX: 'hidden', 
+                WebkitOverflowScrolling: 'touch',
+                touchAction: 'pan-y',
+                position: 'relative', 
+                zIndex: 10,
+                ...(isWorkspaceRoute ? { padding: 0 } : {})
+              }}
+            >
+              <div style={{ width: '100%', minHeight: '100%' }}>
+                {children}
+              </div>
+            </main>
+          </div>
+        );
+      })()}
+      <AlertToast />
+      {quickAddMounted && (
+        <Suspense fallback={null}>
+          <QuickAddLeadModal />
+          <QuickAddMountTrigger onMounted={handleQuickAddChunkMounted} />
+        </Suspense>
+      )}
+
+      {/* Workspace Sticky Pomodoro Timer - only on Bàn làm việc (/workspace, /portal) */}
+      {(location.pathname === '/workspace' || location.pathname === '/portal') && (
+        <WorkspaceStickyPomodoro />
+      )}
+      {showPOS && (
+        <Suspense fallback={null}>
+          <DepositCreateDrawer 
+            isOpen={!!showPOS}
+            onClose={() => setShowPOS(false)} 
+            defaultContact={typeof showPOS === 'object' ? showPOS : null}
+            zIndex={2147483644}
+          />
+        </Suspense>
+      )}
+
+      {/* Unified Approvals Inbox Modal */}
+      {isUnifiedInboxOpen && (
+      <CustomModal
+        isOpen={isUnifiedInboxOpen}
+        onClose={() => setIsUnifiedInboxOpen(false)}
+        title={t("Hộp thư Phê duyệt & Tồn đọng")}
+        width={680}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', padding: '0.25rem 0' }}>
+          <style>{`
+            .unified-inbox-card {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              padding: 14px 18px;
+              background: var(--color-surface);
+              border: 1px solid var(--color-border-light);
+              border-radius: 14px;
+              cursor: pointer;
+              transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+              box-shadow: 0 4px 12px rgba(0, 0, 0, 0.015);
+            }
+            .unified-inbox-card:hover {
+              transform: translateY(-2px);
+              border-color: var(--hover-color) !important;
+              background: var(--hover-bg) !important;
+              box-shadow: 0 10px 25px -8px var(--hover-shadow) !important;
+            }
+            .unified-inbox-icon {
+              width: 38px;
+              height: 38px;
+              border-radius: 10px;
+              display: flex;
+              align-items: center;
+              justify-content: center;
+              transition: all 0.25s ease;
+            }
+            .unified-inbox-card:hover .unified-inbox-icon {
+              transform: scale(1.1) rotate(2deg);
+            }
+            .unified-inbox-card:hover .chevron-arrow {
+              transform: translateX(4px);
+              color: var(--hover-color) !important;
+            }
+            @media (max-width: 768px) {
+              .unified-inbox-card {
+                flex-direction: column !important;
+                align-items: flex-start !important;
+                gap: 12px !important;
+                padding: 14px 16px !important;
+              }
+              .unified-inbox-card > div:last-child {
+                width: 100% !important;
+                justify-content: space-between !important;
+              }
+            }
+          `}</style>
+
+          {/* Header & List Container */}
+          {(() => {
+            const totalPending = totalPendingInboxCount;
+            const hasPendingTasks = totalPending > 0;
+            if (hasPendingTasks) {
+              return (
+                <>
+                  <div style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: '16px', 
+                    marginBottom: '1.5rem', 
+                    background: 'rgba(189, 29, 45, 0.05)', 
+                    padding: '16px', 
+                    borderRadius: '16px', 
+                    border: '1px solid rgba(189, 29, 45, 0.14)' 
+                  }}>
+                    <div style={{ 
+                      width: 48, 
+                      height: 48, 
+                      borderRadius: '12px', 
+                      background: '#BD1D2D', 
+                      display: 'flex', 
+                      justifyContent: 'center', 
+                      alignItems: 'center', 
+                      color: '#fff',
+                      fontWeight: 700,
+                      fontVariantNumeric: 'tabular-nums',
+                      fontSize: '1.25rem'
+                    }}>
+                      {totalPending}
+                    </div>
+                    <div>
+                      <h3 style={{ fontSize: '1.125rem', fontWeight: 700, color: 'var(--color-text)', margin: 0 }}>
+                        {t("Vấn đề cần xử lý")}
+                      </h3>
+                      <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', margin: '4px 0 0', fontWeight: 500 }}>
+                        {t("Bạn đang có các vấn đề tồn đọng cần xử lý:")}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '1.5rem' }}>
+                    {/* 1. Ticket báo lỗi */}
+                    {effTicketsCount > 0 && (
+                      <div 
+                        onClick={() => { setIsUnifiedInboxOpen(false); navigate('/tickets'); }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#ef4444',
+                          '--hover-bg': 'rgba(239, 68, 68, 0.03)',
+                          '--hover-shadow': 'rgba(239, 68, 68, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(239, 68, 68, 0.08)', color: '#ef4444' }}>
+                            <TicketIcon size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Ticket báo lỗi data")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge danger" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem' }}>{effTicketsCount} {t('chờ duyệt')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#BD1D2D',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Duyệt ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 2. AI Pre-screener */}
+                    {effHeldCount > 0 && (
+                      <div 
+                        onClick={() => { setIsUnifiedInboxOpen(false); navigate('/gatekeeper'); }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#f59e0b',
+                          '--hover-bg': 'rgba(245, 158, 11, 0.03)',
+                          '--hover-shadow': 'rgba(245, 158, 11, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(245, 158, 11, 0.08)', color: '#f59e0b' }}>
+                            <AlertTriangle size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Data tạm giữ (AI Lọc)")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge warning" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem', background: 'rgba(245, 158, 11, 0.1)', color: '#d97706' }}>{effHeldCount} {t('chờ duyệt')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#D97706',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Duyệt ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 3. Chấm công */}
+                    {effCheckInsCount > 0 && (
+                      <div 
+                        onClick={() => { setIsUnifiedInboxOpen(false); navigate('/attendance'); }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#BD1D2D',
+                          '--hover-bg': 'rgba(189, 29, 45, 0.03)',
+                          '--hover-shadow': 'rgba(189, 29, 45, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(189, 29, 45, 0.08)', color: '#BD1D2D' }}>
+                            <Clock size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Yêu cầu chấm công bổ sung")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem', background: 'rgba(189, 29, 45, 0.1)', color: 'var(--color-primary)' }}>{effCheckInsCount} {t('chờ duyệt')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#BD1D2D',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Duyệt ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 4. Ký hợp tác */}
+                    {effCoopsCount > 0 && (
+                      <div 
+                        onClick={() => { setIsUnifiedInboxOpen(false); navigate('/cooperation-slips'); }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#BD1D2D',
+                          '--hover-bg': 'rgba(189, 29, 45, 0.03)',
+                          '--hover-shadow': 'rgba(189, 29, 45, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(189, 29, 45, 0.08)', color: '#BD1D2D' }}>
+                            <Scale size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Phê duyệt ký hợp tác chia hoa hồng")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem', background: 'rgba(189, 29, 45, 0.1)', color: 'var(--color-primary)' }}>{effCoopsCount} {t('chờ duyệt')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#BD1D2D',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Duyệt ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 5. Ticket hỗ trợ */}
+                    {supportTicketsCount > 0 && (
+                      <div 
+                        onClick={() => { setIsUnifiedInboxOpen(false); navigate('/support-tickets'); }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#2563eb',
+                          '--hover-bg': 'rgba(37, 99, 235, 0.03)',
+                          '--hover-shadow': 'rgba(37, 99, 235, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(37, 99, 235, 0.08)', color: '#2563eb' }}>
+                            <HelpCircle size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Ticket yêu cầu hỗ trợ (IT/CS)")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem', background: 'rgba(37, 99, 235, 0.1)', color: '#2563eb' }}>{supportTicketsCount} {t('chờ xử lý')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#2563EB',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Xử lý ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 6. Phê duyệt Đề xuất & Chi phí */}
+                    {pendingExpensesCount > 0 && (
+                      <div 
+                        onClick={() => { 
+                          setIsUnifiedInboxOpen(false); 
+                          if (pendingExpensesCount === 1) {
+                            navigate('/approvals?tab=pending&auto_open=1');
+                          } else {
+                            navigate('/approvals?tab=pending');
+                          }
+                        }}
+                        className="unified-inbox-card"
+                        style={{ 
+                          '--hover-color': '#10b981',
+                          '--hover-bg': 'rgba(16, 185, 129, 0.03)',
+                          '--hover-shadow': 'rgba(16, 185, 129, 0.15)'
+                        } as any}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <div className="unified-inbox-icon" style={{ background: 'rgba(16, 185, 129, 0.08)', color: '#10b981' }}>
+                            <CheckSquare size={18} />
+                          </div>
+                          <span style={{ fontSize: '0.875rem', fontWeight: 700, color: 'var(--color-text)' }}>{t("Quy trình & Đề xuất cần duyệt")}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                          <span className="badge success" style={{ borderRadius: '6px', padding: '4px 8px', fontWeight: 600, fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem', background: 'rgba(16, 185, 129, 0.1)', color: '#059669' }}>{pendingExpensesCount} {t('chờ duyệt')}</span>
+                          
+                          <div style={{
+                            borderRadius: '8px',
+                            padding: '6px 12px',
+                            fontWeight: 600,
+                            fontSize: '0.72rem',
+                            color: '#fff',
+                            background: '#059669',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            transition: 'background-color 0.15s cubic-bezier(0.22, 1, 0.36, 1)',
+                            whiteSpace: 'nowrap',
+                            flexShrink: 0
+                          }}>
+                            <span>{t('Duyệt ngay')}</span>
+                            <ChevronRight className="chevron-arrow" size={12} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </>
+              );
+            } else {
+              return (
+                <>
+                  <div style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: '16px', 
+                    marginBottom: '1.5rem', 
+                    background: 'rgba(16, 185, 129, 0.06)', 
+                    padding: '16px', 
+                    borderRadius: '16px', 
+                    border: '1px solid rgba(16, 185, 129, 0.16)' 
+                  }}>
+                    <div style={{ 
+                      width: 48, 
+                      height: 48, 
+                      borderRadius: '12px', 
+                      background: '#059669', 
+                      display: 'flex', 
+                      justifyContent: 'center', 
+                      alignItems: 'center', 
+                      color: '#fff'
+                    }}>
+                      <CheckCircle2 size={24} strokeWidth={1.75} />
+                    </div>
+                    <div>
+                      <h3 style={{ fontSize: '1.125rem', fontWeight: 700, color: 'var(--color-text)', margin: 0 }}>
+                        {t("Không có hồ sơ tồn đọng")}
+                      </h3>
+                      <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', margin: '4px 0 0', fontWeight: 500 }}>
+                        {t("Hiện tại hệ thống không ghi nhận công việc nào cần phê duyệt.")}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '3rem 1.5rem',
+                    background: 'var(--color-bg-secondary)',
+                    border: '1px dashed var(--color-border)',
+                    borderRadius: '16px',
+                    textAlign: 'center',
+                    marginBottom: '1.5rem'
+                  }}>
+                    <CheckCircle2 size={48} style={{ color: '#10b981', marginBottom: '1rem' }} strokeWidth={1.5} />
+                    <span style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--color-text)' }}>
+                      {t("Mọi thứ đã được xử lý hoàn tất")}
+                    </span>
+                    <p style={{ fontSize: '0.8125rem', color: 'var(--color-text-muted)', marginTop: '8px', maxWidth: '380px', lineHeight: 1.5 }}>
+                      {t("Không còn yêu cầu chờ duyệt nào trong danh sách.")}
+                    </p>
+                  </div>
+                </>
+              );
+            }
+          })()}
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginTop: '12px', flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <button 
+                type="button"
+                onClick={() => {
+                  try {
+                    localStorage.setItem('unified_inbox_auto_open_disabled', 'true');
+                    hasAutoOpenedRef.current = true;
+                    toast.success(t('Đã tắt tự động hiển thị hộp thư tồn đọng. Bạn vẫn có thể mở lại bất cứ lúc nào từ biểu tượng trên menu.'));
+                  } catch (e) {}
+                  setIsUnifiedInboxOpen(false);
+                }}
+                className="btn outline sm"
+                style={{ 
+                  borderRadius: '8px', 
+                  padding: '8px 12px', 
+                  fontWeight: 600, 
+                  height: 36, 
+                  fontSize: '0.8rem',
+                  display: 'inline-flex', 
+                  alignItems: 'center', 
+                  gap: '8px',
+                  color: 'var(--color-text-muted)',
+                  borderColor: 'var(--color-border)'
+                }}
+                title={t("Tắt hoàn toàn tự động mở hộp thư tồn đọng khi vào hệ thống")}
+              >
+                <EyeOff size={14} />
+                <span>{t("Không hiển thị lại")}</span>
+              </button>
+
+              <button 
+                type="button"
+                onClick={() => {
+                  try {
+                    const todayStr = new Date().getFullYear() + '-' + String(new Date().getMonth() + 1).padStart(2, '0') + '-' + String(new Date().getDate()).padStart(2, '0');
+                    localStorage.setItem('unified_inbox_dismissed_date', todayStr);
+                    hasAutoOpenedRef.current = true;
+                    toast.success(t('Hộp thư tồn đọng sẽ không tự động mở lại trong ngày hôm nay.'));
+                  } catch (e) {}
+                  setIsUnifiedInboxOpen(false);
+                }}
+                className="btn outline sm"
+                style={{ 
+                  borderRadius: '8px', 
+                  padding: '8px 12px', 
+                  fontWeight: 600, 
+                  height: 36, 
+                  fontSize: '0.8rem',
+                  display: 'inline-flex', 
+                  alignItems: 'center', 
+                  gap: '8px',
+                  color: 'var(--color-text-muted)',
+                  borderColor: 'var(--color-border)'
+                }}
+                title={t("Không tự động hiển thị lại trong ngày hôm nay")}
+              >
+                <Clock size={14} />
+                <span>{t("Không nhắc hôm nay")}</span>
+              </button>
+            </div>
+
+            <button 
+              onClick={() => setIsUnifiedInboxOpen(false)}
+              className="btn outline sm"
+              style={{ borderRadius: '8px', padding: '8px 20px', fontWeight: 600, height: 36, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              {t("Đóng")}
+            </button>
+          </div>
+        </div>
+      </CustomModal>
+      )}
+
+      {/* Sales Pending Signatures Modal */}
+      {isSalesSignModalOpen && (
+      <CustomModal
+        isOpen={isSalesSignModalOpen}
+        onClose={() => setIsSalesSignModalOpen(false)}
+        title={t("Hợp đồng / Phiếu hợp tác chờ ký")}
+        width={420}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', textAlign: 'center', padding: '1rem 0.5rem' }}>
+          <div style={{ 
+            width: 56, 
+            height: 56, 
+            borderRadius: '50%', 
+            background: 'rgba(16, 185, 129, 0.08)', 
+            display: 'flex', 
+            justifyContent: 'center', 
+            alignItems: 'center', 
+            marginBottom: '1rem',
+            color: 'var(--color-success)'
+          }}>
+            <Scale size={28} strokeWidth={1.75} />
+          </div>
+          
+          <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: 'var(--color-text)', marginBottom: '0.5rem' }}>
+            {t("Bạn có hợp đồng chờ ký")}
+          </h3>
+          
+          <p style={{ fontSize: '0.875rem', color: 'var(--color-text-muted)', lineHeight: '1.5', marginBottom: '1.5rem' }}>
+            {t("Hệ thống ghi nhận bạn đang có")} <strong style={{ color: 'var(--color-success)', fontSize: '1.05rem', fontWeight: 700, fontVariantNumeric: 'tabular-nums' }}>{salesPendingSignCount}</strong> {t("phiếu hợp tác phân chia hoa hồng dự án đang chờ bạn ký xác nhận.")}
+          </p>
+
+          <div style={{ display: 'flex', gap: '12px', width: '100%' }}>
+            <button 
+              onClick={() => setIsSalesSignModalOpen(false)}
+              className="btn outline"
+              style={{ flex: 1, borderRadius: '8px', height: 40, fontWeight: 600 }}
+            >
+              {t("Để sau")}
+            </button>
+            <button 
+              onClick={() => {
+                setIsSalesSignModalOpen(false);
+                navigate('/cooperation-slips');
+              }}
+              className="btn primary"
+              style={{ 
+                flex: 1, 
+                borderRadius: '8px', 
+                height: 40, 
+                fontWeight: 600,
+                background: '#059669',
+                borderColor: '#059669',
+                color: 'white'
+              }}
+            >
+              {t("Ký ngay")}
+            </button>
+          </div>
+        </div>
+      </CustomModal>
+      )}
+
+      {/* Activity Feed Modal */}
+      {isActivityFeedOpen && (
+      <CustomModal
+        isOpen={isActivityFeedOpen}
+        onClose={() => setIsActivityFeedOpen(false)}
+        title={t("Bản tin hoạt động hệ thống")}
+        width={850}
+        zIndex={2147483640}
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', height: '60vh' }}>
+          {/* Tab Selector */}
+          <div 
+            className="logs-tab-container"
+            style={{ 
+              display: 'flex', 
+              gap: '1.5rem', 
+              borderBottom: '1px solid var(--color-border-light)', 
+              marginBottom: '0.75rem',
+              paddingBottom: '0.25rem' 
+            }}
+          >
+            <button
+              className="logs-tab-btn"
+              onClick={() => setActiveTab('activity')}
+              style={{
+                background: 'none',
+                border: 'none',
+                borderBottom: activeTab === 'activity' ? '2px solid var(--color-primary)' : '2px solid transparent',
+                color: activeTab === 'activity' ? 'var(--color-primary)' : 'var(--color-text-muted)',
+                fontWeight: activeTab === 'activity' ? 700 : 500,
+                fontSize: '0.875rem',
+                padding: '6px 4px',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+                outline: 'none'
+              }}
+            >
+              {t("Hoạt động hệ thống")}
+            </button>
+            <button
+              className="logs-tab-btn"
+              onClick={() => setActiveTab('logs')}
+              style={{
+                background: 'none',
+                border: 'none',
+                borderBottom: activeTab === 'logs' ? '2px solid var(--color-primary)' : '2px solid transparent',
+                color: activeTab === 'logs' ? 'var(--color-primary)' : 'var(--color-text-muted)',
+                fontWeight: activeTab === 'logs' ? 700 : 500,
+                fontSize: '0.875rem',
+                padding: '6px 4px',
+                cursor: 'pointer',
+                transition: 'all 0.2s',
+                outline: 'none'
+              }}
+            >
+              {t("Check Log Notify")}
+            </button>
+          </div>
+
+          {activeTab === 'activity' ? (
+            <>
+              {/* Subheader with refresh info */}
+              <div style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: '0.75rem',
+                paddingBottom: '0.5rem',
+                borderBottom: '1px solid var(--color-border-light)'
+              }}>
+                <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--color-primary)', display: 'inline-block' }} />
+                  {t("Danh sách hoạt động và phân bổ gần đây nhất")}
+                </span>
+              </div>
+
+              {/* List content */}
+              <div style={{ flex: 1, overflowY: 'auto', paddingRight: 4 }}>
+                {feedItems.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {feedItems.slice((currentPage - 1) * pageSize, currentPage * pageSize).map((item) => {
+                      const config = getActivityIcon(item);
+                      const isExpanded = expandedFeedItem === item.id;
+                      const entityName = item.type === 'distribution' 
+                        ? (item.consultant_name || t('Hệ thống'))
+                        : (item.type === 'ticket'
+                            ? (item.consultant_name || t('Hệ thống'))
+                            : (item.admin_name || t('Hệ thống')));
+                      
+                      return (
+                        <div 
+                          key={item.id}
+                          style={{
+                            padding: '6px 10px',
+                            background: 'var(--color-surface)',
+                            border: '1px solid var(--color-border-light)',
+                            borderRadius: '8px',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            transition: 'all 0.2s',
+                            boxShadow: '0 1px 2px rgba(0,0,0,0.01)'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'flex-start', gap: '10px' }}>
+                            <div style={{ flexShrink: 0, position: 'relative' }}>
+                              <Avatar 
+                                src={item.consultant_avatar}
+                                name={entityName} 
+                                size={32} 
+                              />
+                              <div style={{
+                                position: 'absolute',
+                                bottom: -2,
+                                right: -2,
+                                width: 14,
+                                height: 14,
+                                borderRadius: '50%',
+                                background: 'var(--color-surface)',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.15)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                color: config.color,
+                                fontSize: '8px'
+                              }}>
+                                {React.cloneElement(config.icon, { size: 10 })}
+                              </div>
+                            </div>
+
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '4px' }}>
+                                <span style={{ fontSize: '0.8125rem', fontWeight: 700, color: 'var(--color-text)' }}>
+                                  {item.title}
+                                </span>
+                                <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
+                                  {new Date(item.timestamp).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} {new Date(item.timestamp).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' })}
+                                </span>
+                              </div>
+
+                              <div 
+                                style={{ fontSize: '0.78125rem', color: 'var(--color-text-light)', marginTop: '2px', lineHeight: '1.4' }}
+                                dangerouslySetInnerHTML={{ __html: sanitizeHtml(item.description) }}
+                              />
+                              
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '6px' }}>
+                                <span style={{
+                                  fontSize: '0.625rem',
+                                  fontWeight: 700,
+                                  textTransform: 'uppercase',
+                                  padding: '1px 6px',
+                                  borderRadius: '4px',
+                                  background: config.bg,
+                                  color: config.color
+                                }}>
+                                  {item.tag}
+                                </span>
+
+                                {item.details && (
+                                  <button
+                                    onClick={() => setExpandedFeedItem(isExpanded ? null : item.id)}
+                                    style={{
+                                      background: 'none',
+                                      border: 'none',
+                                      color: 'var(--color-text-light)',
+                                      fontSize: '0.71875rem',
+                                      fontWeight: 600,
+                                      cursor: 'pointer',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: 2,
+                                      outline: 'none',
+                                      padding: '2px'
+                                    }}
+                                  >
+                                    {isExpanded ? (
+                                      <>{t('Thu gọn')} <ChevronUp size={12} /></>
+                                    ) : (
+                                      <>{t('Chi tiết')} <ChevronDown size={12} /></>
+                                    )}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          {isExpanded && item.details && (
+                            <div style={{
+                              marginTop: '8px',
+                              padding: '8px 10px',
+                              background: 'var(--color-bg)',
+                              border: '1px solid var(--color-border)',
+                              borderRadius: '6px',
+                              fontSize: '0.75rem',
+                              color: 'var(--color-text-light)',
+                              fontFamily: 'monospace',
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-all',
+                              maxHeight: '120px',
+                              overflowY: 'auto'
+                            }}>
+                              {(() => {
+                                try {
+                                  const parsed = JSON.parse(item.details);
+                                  return JSON.stringify(parsed, null, 2);
+                                } catch (e) {
+                                  return item.details;
+                                }
+                              })()}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--color-text-muted)', gap: 8 }}>
+                    <Activity size={32} style={{ opacity: 0.5 }} />
+                    <span style={{ fontSize: '0.875rem' }}>{t('Không có hoạt động nào được ghi nhận gần đây.')}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Pagination Controls */}
+              {feedItems.length > pageSize && (
+                <div 
+                  className="pagination-container"
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginTop: '12px',
+                    paddingTop: '8px',
+                    borderTop: '1px solid var(--color-border-light)'
+                  }}
+                >
+                  <span 
+                    className="pagination-text"
+                    style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', fontWeight: 600 }}
+                  >
+                    {t('Hiển thị')} {((currentPage - 1) * pageSize) + 1} - {Math.min(currentPage * pageSize, feedItems.length)} {t('của')} {feedItems.length} {t('hoạt động')}
+                  </span>
+                  
+                  <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                    <button
+                      disabled={currentPage === 1}
+                      onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+                      className="btn outline"
+                      style={{
+                        padding: '3px 8px',
+                        height: '26px',
+                        fontSize: '0.7rem',
+                        fontWeight: 700,
+                        cursor: currentPage === 1 ? 'not-allowed' : 'pointer',
+                        opacity: currentPage === 1 ? 0.5 : 1
+                      }}
+                    >
+                      {t('Trước')}
+                    </button>
+                    
+                    {(() => {
+                      const totalPages = Math.ceil(feedItems.length / pageSize);
+                      const pages: (number | string)[] = [];
+                      if (totalPages <= 7) {
+                        for (let i = 1; i <= totalPages; i++) pages.push(i);
+                      } else {
+                        pages.push(1);
+                        if (currentPage > 4) pages.push('ellipsis-start');
+                        
+                        const start = Math.max(2, currentPage - 2);
+                        const end = Math.min(totalPages - 1, currentPage + 2);
+                        
+                        for (let i = start; i <= end; i++) {
+                          pages.push(i);
+                        }
+                        
+                        if (currentPage < totalPages - 3) pages.push('ellipsis-end');
+                        pages.push(totalPages);
+                      }
+
+                      return pages.map((page, idx) => {
+                        if (page === 'ellipsis-start' || page === 'ellipsis-end') {
+                          return (
+                            <span 
+                              key={`ellipsis-${idx}`} 
+                              style={{ 
+                                width: '26px', 
+                                height: '26px', 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                justifyContent: 'center', 
+                                fontSize: '0.75rem', 
+                                color: 'var(--color-text-muted)' 
+                              }}
+                            >
+                              ...
+                            </span>
+                          );
+                        }
+
+                        const pageNum = page as number;
+                        return (
+                          <button
+                            key={pageNum}
+                            onClick={() => setCurrentPage(pageNum)}
+                            style={{
+                              width: '26px',
+                              height: '26px',
+                              borderRadius: '4px',
+                              border: '1px solid var(--color-border-light)',
+                              background: currentPage === pageNum ? 'var(--color-primary)' : 'var(--color-surface)',
+                              color: currentPage === pageNum ? 'white' : 'var(--color-text)',
+                              fontSize: '0.7rem',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              transition: 'all 0.2s'
+                            }}
+                          >
+                            {pageNum}
+                          </button>
+                        );
+                      });
+                    })()}
+
+                    <button
+                      disabled={currentPage === Math.ceil(feedItems.length / pageSize)}
+                      onClick={() => setCurrentPage(prev => Math.min(prev + 1, Math.ceil(feedItems.length / pageSize)))}
+                      className="btn outline"
+                      style={{
+                        padding: '3px 8px',
+                        height: '26px',
+                        fontSize: '0.7rem',
+                        fontWeight: 700,
+                        cursor: currentPage === Math.ceil(feedItems.length / pageSize) ? 'not-allowed' : 'pointer',
+                        opacity: currentPage === Math.ceil(feedItems.length / pageSize) ? 0.5 : 1
+                      }}
+                    >
+                      {t('Sau')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <>
+              {/* Check Log subtab content */}
+              {/* Tool bar: Search & Filters */}
+              <div 
+                className="logs-toolbar"
+                style={{
+                  display: 'flex',
+                  gap: '0.75rem',
+                  alignItems: 'center',
+                  marginBottom: '1rem',
+                  flexWrap: 'wrap',
+                  background: 'rgba(255, 255, 255, 0.01)',
+                  padding: '0.75rem',
+                  borderRadius: '8px',
+                  border: '1px solid var(--color-border-light)'
+                }}
+              >
+                {/* Search */}
+                <div 
+                  className="logs-search-wrapper"
+                  style={{ flex: 1, minWidth: '200px', position: 'relative' }}
+                >
+                  <input
+                    type="text"
+                    placeholder={t("Tìm kiếm Sale, Chat ID, nội dung...")}
+                    value={notifSearchInput}
+                    onChange={(e) => setNotifSearchInput(e.target.value)}
+                    style={{
+                      width: '100%',
+                      height: '36px',
+                      paddingLeft: '32px',
+                      paddingRight: '12px',
+                      borderRadius: '8px',
+                      border: '1px solid var(--color-border)',
+                      background: 'var(--color-surface)',
+                      color: 'var(--color-text)',
+                      fontSize: '0.85rem'
+                    }}
+                  />
+                  <Search size={14} style={{ position: 'absolute', left: '10px', top: '11px', color: 'var(--color-text-muted)' }} />
+                </div>
+
+                {/* Filter Kênh */}
+                <div 
+                  className="logs-toolbar-item"
+                  style={{ minWidth: '130px' }}
+                >
+                  <CustomSelect
+                    options={[
+                      { value: 'all', label: t('Tất cả kênh') },
+                      { 
+                        value: 'zalo', 
+                        label: 'Zalo', 
+                        icon: (
+                          <img 
+                            src="https://stc-zpl.zdn.vn/favicon.ico" 
+                            alt="Zalo" 
+                            style={{ width: 14, height: 14, objectFit: 'contain', borderRadius: '50%' }} 
+                          />
+                        ) 
+                      },
+                      { 
+                        value: 'telegram', 
+                        label: 'Telegram', 
+                        icon: (
+                          <img 
+                            src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/3840px-Telegram_logo.svg.png" 
+                            alt="Telegram" 
+                            style={{ width: 14, height: 14, objectFit: 'contain', borderRadius: '50%' }} 
+                          />
+                        ) 
+                      },
+                      { value: 'email', label: 'Email', icon: <Mail size={12} style={{ color: 'var(--color-info)' }} /> }
+                    ]}
+                    value={notifFilterChannel}
+                    onChange={(val) => setNotifFilterChannel(val)}
+                  />
+                </div>
+
+                {/* Filter Loại tin */}
+                <div 
+                  className="logs-toolbar-item"
+                  style={{ minWidth: '150px' }}
+                >
+                  <CustomSelect
+                    options={[
+                      { value: 'all', label: t('Tất cả loại tin') },
+                      { value: 'sale', label: t('Tin gửi Sale'), icon: <UserCheck size={12} style={{ color: 'var(--color-primary)' }} /> },
+                      { value: 'admin', label: t('Tin Admin check'), icon: <ShieldAlert size={12} style={{ color: 'var(--color-danger)' }} /> }
+                    ]}
+                    value={notifFilterType}
+                    onChange={(val) => setNotifFilterType(val)}
+                  />
+                </div>
+
+                {/* Filter Sale */}
+                <div 
+                  className="logs-sale-wrapper"
+                  style={{ minWidth: '180px' }}
+                >
+                  <CustomSelect
+                    options={[
+                      { value: 'all', label: t('Tất cả Sale') },
+                      ...consultants.map(c => ({
+                        value: String(c.id),
+                        label: c.name,
+                        avatar: c.avatar,
+                        sublabel: c.email || c.zalo_chat_id || undefined
+                      }))
+                    ]}
+                    value={notifFilterSale}
+                    onChange={(val) => setNotifFilterSale(val)}
+                    showAvatars={true}
+                    searchable={true}
+                    placeholder={t("Chọn Sale...")}
+                    align="right"
+                  />
+                </div>
+              </div>
+
+              {/* Logs Content list */}
+              <div style={{ flex: 1, overflowY: 'auto', paddingRight: 4 }}>
+                {isNotifLogsLoading ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12, padding: '1rem' }}>
+                    <StatRowSkeleton />
+                    <StatRowSkeleton />
+                    <StatRowSkeleton />
+                    <StatRowSkeleton />
+                  </div>
+                ) : notifLogs.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {notifLogs.map((log) => {
+                      const isExpanded = expandedLogId === log.id;
+                      const hasDetails = log.body && log.body.length > 0;
+                      const isEmail = log.channel === 'email';
+                      const userMeta = getAvatarAndNameByTarget(log.target);
+                      const formattedTime = new Date(log.created_at).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' ' + new Date(log.created_at).toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit' });
+                      
+                      const getChannelText = (item: any) => {
+                        let channel = 'Zalo';
+                        if (item.channel === 'email') channel = 'Email';
+                        else if (item.channel === 'telegram') channel = 'Telegram';
+                        const type = item.type === 'admin' ? t('Admin') : t('Sale');
+                        const direct = item.is_direct ? ' (direct)' : '';
+                        return `${channel}${direct} • ${type}`;
+                      };
+
+                      const getStatusIndicator = (status: string) => {
+                        switch (status) {
+                          case 'sent':
+                            return <span style={{ color: 'var(--color-success)', fontSize: '0.75rem', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 3 }}><CheckCircle2 size={12} /> {t('Đã gửi')}</span>;
+                          case 'pending':
+                            return <span style={{ color: 'var(--color-warning)', fontSize: '0.75rem', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 3 }}><Clock size={12} /> {t('Đang chờ')}</span>;
+                          default:
+                            return <span style={{ color: 'var(--color-danger)', fontSize: '0.75rem', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 3 }}><XCircle size={12} /> {t('Thất bại')}</span>;
+                        }
+                      };
+
+                      return (
+                        <div
+                          key={log.id}
+                          style={{
+                            padding: '10px 12px',
+                            background: 'var(--color-surface)',
+                            border: '1px solid var(--color-border-light)',
+                            borderRadius: '8px',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            transition: 'all 0.2s',
+                            boxShadow: '0 1px 2px rgba(0,0,0,0.01)'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                            {/* Avatar with Channel Icon in corner */}
+                            <div style={{ position: 'relative', flexShrink: 0 }}>
+                              <Avatar 
+                                src={userMeta.avatar} 
+                                name={userMeta.name} 
+                                size={36} 
+                              />
+                              <div style={{
+                                position: 'absolute',
+                                bottom: -2,
+                                right: -2,
+                                width: 16,
+                                height: 16,
+                                borderRadius: '50%',
+                                background: 'var(--color-surface)',
+                                boxShadow: '0 1px 3px rgba(0,0,0,0.15)',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                overflow: 'hidden',
+                                padding: '1px'
+                              }}>
+                                {log.channel === 'email' ? (
+                                  <img 
+                                    src="/imgs/gmail-icon-free-png.webp" 
+                                    alt="Gmail" 
+                                    style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: '50%' }} 
+                                  />
+                                ) : log.channel === 'telegram' ? (
+                                  <img 
+                                    src="https://upload.wikimedia.org/wikipedia/commons/thumb/8/82/Telegram_logo.svg/3840px-Telegram_logo.svg.png" 
+                                    alt="Telegram" 
+                                    style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: '50%' }} 
+                                  />
+                                ) : (
+                                  <img 
+                                    src="https://stc-zpl.zdn.vn/favicon.ico" 
+                                    alt="Zalo" 
+                                    style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: '50%' }} 
+                                  />
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Main row Info */}
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '4px' }}>
+                                <span style={{ fontSize: '0.8125rem', fontWeight: 700, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={log.target}>
+                                  {userMeta.name}
+                                </span>
+                                <span style={{ fontSize: '0.6875rem', color: 'var(--color-text-muted)' }}>
+                                  {formattedTime}
+                                </span>
+                              </div>
+
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '4px', flexWrap: 'wrap', gap: 6 }}>
+                                <span style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                                  {getChannelText(log)}
+                                </span>
+
+                                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                                  {getStatusIndicator(log.status)}
+
+                                  {log.body && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        navigator.clipboard.writeText(log.body);
+                                        setCopySuccessId(log.id);
+                                        setTimeout(() => setCopySuccessId(null), 1500);
+                                      }}
+                                      style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        color: copySuccessId === log.id ? 'var(--color-success)' : 'var(--color-text-muted)',
+                                        cursor: 'pointer',
+                                        padding: '2px',
+                                        outline: 'none',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 2,
+                                        fontSize: '0.7rem',
+                                        fontWeight: 600
+                                      }}
+                                      title={t("Copy nội dung tin nhắn")}
+                                    >
+                                      {copySuccessId === log.id ? (
+                                        <><Check size={12} /> {t("Đã copy")}</>
+                                      ) : (
+                                        <><Copy size={12} /> {t("Copy")}</>
+                                      )}
+                                    </button>
+                                  )}
+
+                                  {hasDetails && (
+                                    <button
+                                      onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
+                                      style={{
+                                        background: 'none',
+                                        border: 'none',
+                                        color: 'var(--color-text-light)',
+                                        fontSize: '0.71875rem',
+                                        fontWeight: 600,
+                                        cursor: 'pointer',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: 2,
+                                        outline: 'none',
+                                        padding: '2px'
+                                      }}
+                                    >
+                                      {isExpanded ? (
+                                        <>{t('Thu gọn')} <ChevronUp size={12} /></>
+                                      ) : (
+                                        <>{t('Chi tiết')} <ChevronDown size={12} /></>
+                                      )}
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+
+
+                          {/* Expanded Content */}
+                          {isExpanded && log.body && (
+                            <div style={{
+                              marginTop: '8px',
+                              padding: '10px 12px',
+                              background: 'var(--color-bg)',
+                              border: '1px solid var(--color-border)',
+                              borderRadius: '6px',
+                              fontSize: '0.8rem',
+                              color: 'var(--color-text)',
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-all',
+                              maxHeight: '220px',
+                              overflowY: 'auto',
+                              lineHeight: '1.5',
+                              fontFamily: isEmail ? 'inherit' : 'monospace'
+                            }}>
+                              {isEmail && <div style={{ borderBottom: '1px solid var(--color-border-light)', paddingBottom: '6px', marginBottom: '8px', fontWeight: 700 }}>{t("Tiêu đề email:")} {log.subject}</div>}
+                              {log.body}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--color-text-muted)', gap: 8 }}>
+                    <MessageSquare size={32} style={{ opacity: 0.5 }} />
+                    <span style={{ fontSize: '0.875rem' }}>{t('Không tìm thấy log thông báo nào.')}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Logs Pagination */}
+              {!isNotifLogsLoading && notifTotalCount > 10 && (
+                <div 
+                  className="pagination-container"
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    marginTop: '12px',
+                    paddingTop: '8px',
+                    borderTop: '1px solid var(--color-border-light)'
+                  }}
+                >
+                  <span 
+                    className="pagination-text"
+                    style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', fontWeight: 600 }}
+                  >
+                    {t('Hiển thị')} {((notifPage - 1) * 10) + 1} - {Math.min(notifPage * 10, notifTotalCount)} {t('của')} {notifTotalCount} {t('log')}
+                  </span>
+                  
+                  <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                    <button
+                      disabled={notifPage === 1}
+                      onClick={() => setNotifPage(prev => Math.max(prev - 1, 1))}
+                      className="btn outline"
+                      style={{
+                        padding: '3px 8px',
+                        height: '26px',
+                        fontSize: '0.7rem',
+                        fontWeight: 700,
+                        cursor: notifPage === 1 ? 'not-allowed' : 'pointer',
+                        opacity: notifPage === 1 ? 0.5 : 1
+                      }}
+                    >
+                      {t('Trước')}
+                    </button>
+                    
+                    {(() => {
+                      const totalPages = Math.ceil(notifTotalCount / 10);
+                      const pages: (number | string)[] = [];
+                      if (totalPages <= 7) {
+                        for (let i = 1; i <= totalPages; i++) pages.push(i);
+                      } else {
+                        pages.push(1);
+                        if (notifPage > 4) pages.push('ellipsis-start');
+                        
+                        const start = Math.max(2, notifPage - 2);
+                        const end = Math.min(totalPages - 1, notifPage + 2);
+                        
+                        for (let i = start; i <= end; i++) {
+                          pages.push(i);
+                        }
+                        
+                        if (notifPage < totalPages - 3) pages.push('ellipsis-end');
+                        pages.push(totalPages);
+                      }
+
+                      return pages.map((page, idx) => {
+                        if (page === 'ellipsis-start' || page === 'ellipsis-end') {
+                          return (
+                            <span 
+                              key={`ellipsis-${idx}`} 
+                              style={{ 
+                                width: '26px', 
+                                height: '26px', 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                justifyContent: 'center', 
+                                fontSize: '0.75rem', 
+                                color: 'var(--color-text-muted)' 
+                              }}
+                            >
+                              ...
+                            </span>
+                          );
+                        }
+
+                        const pageNum = page as number;
+                        return (
+                          <button
+                            key={pageNum}
+                            onClick={() => setNotifPage(pageNum)}
+                            style={{
+                              width: '26px',
+                              height: '26px',
+                              borderRadius: '4px',
+                              border: '1px solid var(--color-border-light)',
+                              background: notifPage === pageNum ? 'var(--color-primary)' : 'var(--color-surface)',
+                              color: notifPage === pageNum ? 'white' : 'var(--color-text)',
+                              fontSize: '0.7rem',
+                              fontWeight: 700,
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              transition: 'all 0.2s'
+                            }}
+                          >
+                            {pageNum}
+                          </button>
+                        );
+                      });
+                    })()}
+
+                    <button
+                      disabled={notifPage === Math.ceil(notifTotalCount / 10)}
+                      onClick={() => setNotifPage(prev => Math.min(prev + 1, Math.ceil(notifTotalCount / 10)))}
+                      className="btn outline"
+                      style={{
+                        padding: '3px 8px',
+                        height: '26px',
+                        fontSize: '0.7rem',
+                        fontWeight: 700,
+                        cursor: notifPage === Math.ceil(notifTotalCount / 10) ? 'not-allowed' : 'pointer',
+                        opacity: notifPage === Math.ceil(notifTotalCount / 10) ? 0.5 : 1
+                      }}
+                    >
+                      {t('Sau')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </CustomModal>
+      )}
+      
+      {/* Mobile Bottom Navigation Bar */}
+      <div className="mobile-bottom-nav">
+        {bottomNavItems.map((item, idx) => {
+          const Icon = item.icon;
+          const isActive = location.pathname === item.href || 
+            (item.href === '/' && location.pathname === '/sale-portal') ||
+            (item.href === '/sale-portal' && location.pathname === '/');
+
+          if (item.isCenter) {
+            return (
+              <button 
+                key={idx}
+                className={`mobile-bottom-nav-center-item ${isActive ? 'active' : ''}`}
+                onClick={() => navigate(item.href)}
+              >
+                <div className="raised-button-bg-hump" />
+                <div className="raised-button-circle">
+                  <Icon size={24} />
+                </div>
+                <span className="mobile-bottom-nav-item-label">{item.label}</span>
+              </button>
+            );
+          }
+
+          return (
+            <button 
+              key={idx}
+              className={`mobile-bottom-nav-item ${isActive ? 'active' : ''}`}
+              onClick={() => navigate(item.href)}
+              style={{ position: 'relative' }}
+            >
+              <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Icon size={20} />
+                {Boolean(item.badge && item.badge > 0) && (
+                  <span style={{
+                    position: 'absolute',
+                    top: -4,
+                    right: -8,
+                    minWidth: 16,
+                    height: 16,
+                    borderRadius: 8,
+                    background: '#ef4444',
+                    color: '#ffffff',
+                    fontSize: '9px',
+                    fontWeight: 800,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    padding: '0 3px',
+                    boxShadow: '0 2px 5px rgba(239, 68, 68, 0.4)',
+                    lineHeight: 1,
+                    zIndex: 10
+                  }}>
+                    {item.badge > 99 ? '99+' : item.badge}
+                  </span>
+                )}
+              </div>
+              <span className="mobile-bottom-nav-item-label">{item.label}</span>
+            </button>
+          );
+        })}
+      </div>
+      {/* Tạm thời tắt AI Chat theo yêu cầu */}
+      {/* <AIChatbot /> */}
+
+
+
+      {checkInModalOpen && (
+        <Suspense fallback={null}>
+          <SmartCheckInModal
+            isOpen={checkInModalOpen}
+            onClose={() => setCheckInModalOpen(false)}
+            todayCheckIn={todayCheckIn}
+            consultantProfile={consultantProfile}
+            user={user}
+            requireCheckout={sysSettings?.require_checkout === '1' || sysSettings?.require_checkout === 1}
+            onCheckInSuccess={() => {
+              loadCheckInStatus();
+              window.dispatchEvent(new CustomEvent('checkin-status-changed'));
+            }}
+          />
+        </Suspense>
+      )}
+
+      {isTelegramModalOpen && (
+        <CustomModal
+          isOpen={isTelegramModalOpen}
+          onClose={() => setIsTelegramModalOpen(false)}
+          title={t("Liên kết Telegram")}
+          width="380px"
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1.25rem', padding: '1rem 0 0.5rem 0', textAlign: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '20px', margin: '0.5rem 0 0.25rem 0' }}>
+              {/* IDEAS Logo */}
+              <div style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: '50%',
+                backgroundColor: '#fff',
+                border: '2px solid var(--color-border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 4px 10px rgba(0, 0, 0, 0.05)',
+                overflow: 'hidden'
+              }}>
+                <img 
+                  src="/LOGO.jpg" 
+                  alt="IDEAS" 
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }} 
+                />
+              </div>
+
+              {/* Connecting icon */}
+              <div style={{ display: 'flex', alignItems: 'center', color: '#BD1D2D' }}>
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                </svg>
+              </div>
+
+              {/* Telegram Logo */}
+              <div style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: '50%',
+                background: '#0088cc',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 8px 16px rgba(0, 136, 204, 0.25)',
+                color: '#fff'
+              }}>
+                <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
+                  <path d="M21.9 2.1c-.2-.1-.5-.1-.7 0L1.6 9.8c-.6.2-.7.6-.2.9l5.3 1.9 2 6.2c.2.5.5.6.8.3l3-2.6 5.3 3.9c.7.5 1.3.2 1.5-.6l3.9-18.3c.2-.7-.3-1.2-1.1-1.1zM8.9 11.9l8.6-5.4c.1-.1.3 0 .2.1l-7.2 6.5-.3 2.5c-.1.5-.4.6-.6.1l-1.7-4.4z"/>
+                </svg>
+              </div>
+            </div>
+
+            <p style={{ margin: 0, fontSize: '0.925rem', color: 'var(--color-text)', lineHeight: '1.6', padding: '0 8px' }}>
+              {t('Nhấp nút bên dưới để mở Telegram và kích hoạt nhận thông báo chia data khách hàng tức thời.')}
+            </p>
+
+            <div style={{
+              display: 'flex',
+              flexDirection: 'column',
+              width: '100%',
+              gap: '10px',
+              marginTop: '0.5rem',
+              paddingBottom: 'calc(env(safe-area-inset-bottom) + 20px)'
+            }}>
+              <a
+                href={`https://t.me/${sysSettings?.telegram_bot_username || 'Ideasvietnam_bot'}?start=${consultantProfile?.id || user?.id || ''}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setIsTelegramModalOpen(false)}
+                className="btn primary"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: '#BD1D2D',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '12px',
+                  borderRadius: '10px',
+                  fontWeight: 700,
+                  fontSize: '0.925rem',
+                  textDecoration: 'none',
+                  boxShadow: '0 4px 12px rgba(189, 29, 45, 0.25)',
+                  transition: 'all 0.2s'
+                }}
+              >
+                LIÊN KẾT NHANH 1-CLICK
+              </a>
+            </div>
+          </div>
+        </CustomModal>
+      )}
+
+      <style>{`
+        @keyframes pulse-avatar-global {
+          0% { transform: scale(1); box-shadow: 0 4px 20px rgba(189, 29, 45, 0.4); }
+          50% { transform: scale(1.08); box-shadow: 0 4px 24px rgba(189, 29, 45, 0.7); }
+          100% { transform: scale(1); box-shadow: 0 4px 20px rgba(189, 29, 45, 0.4); }
+        }
+      `}</style>
+    </div>
+  );
+};
+
